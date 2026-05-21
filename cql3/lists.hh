@@ -43,6 +43,9 @@ public:
         virtual bool requires_read() const override;
         virtual void fill_prepare_context(prepare_context& ctx) override;
         virtual void execute(mutation& m, const clustering_key_prefix& prefix, const update_parameters& params) override;
+        size_t external_memory_usage() const override {
+            return operation::external_memory_usage() + _idx.external_memory_usage();
+        }
     };
 
     class setter_by_uuid : public setter_by_index {

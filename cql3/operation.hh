@@ -61,6 +61,14 @@ public:
 
     virtual ~operation() {}
 
+    virtual size_t external_memory_usage() const {
+        size_t s = 0;
+        if (_e) {
+            s += _e->external_memory_usage();
+        }
+        return s;
+    }
+
     virtual bool is_raw_counter_shard_write() const {
         return false;
     }

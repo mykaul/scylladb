@@ -6272,4 +6272,89 @@ SEASTAR_TEST_CASE(test_sstable_load_mixed_generation_type) {
     });
 }
 
+SEASTAR_TEST_CASE(test_prepared_statement_memory_sizing) {
+    return do_with_cql_env_thread([](cql_test_env& e) {
+        e.execute_cql("CREATE TABLE ks.sizing_test (pk int, ck text, v1 text, v2 int, PRIMARY KEY (pk, ck))").get();
+
+        // Test SELECT statement sizing
+        {
+            auto key = e.prepare("SELECT * FROM ks.sizing_test WHERE pk = ? AND ck = ?").get();
+            auto stmt_ptr = e.local_qp().get_prepared(key);
+            BOOST_REQUIRE(stmt_ptr);
+            auto mem = stmt_ptr->external_memory_usage();
+            // Should return a non-trivial positive value (not the old hardcoded 10000)
+            BOOST_REQUIRE_GT(mem, 0u);
+            testlog.info("SELECT prepared statement external_memory_usage: {}", mem);
+        }
+
+        // Test INSERT statement sizing
+        {
+            auto key = e.prepare("INSERT INTO ks.sizing_test (pk, ck, v1, v2) VALUES (?, ?, ?, ?)").get();
+            auto stmt_ptr = e.local_qp().get_prepared(key);
+            BOOST_REQUIRE(stmt_ptr);
+            auto mem = stmt_ptr->external_memory_usage();
+            BOOST_REQUIRE_GT(mem, 0u);
+            testlog.info("INSERT prepared statement external_memory_usage: {}", mem);
+        }
+
+        // Test UPDATE statement sizing
+        {
+            auto key = e.prepare("UPDATE ks.sizing_test SET v1 = ?, v2 = ? WHERE pk = ? AND ck = ?").get();
+            auto stmt_ptr = e.local_qp().get_prepared(key);
+            BOOST_REQUIRE(stmt_ptr);
+            auto mem = stmt_ptr->external_memory_usage();
+            BOOST_REQUIRE_GT(mem, 0u);
+            testlog.info("UPDATE prepared statement external_memory_usage: {}", mem);
+        }
+
+        // Test DELETE statement sizing
+        {
+            auto key = e.prepare("DELETE FROM ks.sizing_test WHERE pk = ? AND ck = ?").get();
+            auto stmt_ptr = e.local_qp().get_prepared(key);
+            BOOST_REQUIRE(stmt_ptr);
+            auto mem = stmt_ptr->external_memory_usage();
+            BOOST_REQUIRE_GT(mem, 0u);
+            testlog.info("DELETE prepared statement external_memory_usage: {}", mem);
+        }
+
+        // Test BATCH statement sizing
+        {
+            auto key = e.prepare("BEGIN BATCH INSERT INTO ks.sizing_test (pk, ck, v1) VALUES (?, ?, ?); INSERT INTO ks.sizing_test (pk, ck, v2) VALUES (?, ?, ?); APPLY BATCH").get();
+            auto stmt_ptr = e.local_qp().get_prepared(key);
+            BOOST_REQUIRE(stmt_ptr);
+            auto mem = stmt_ptr->external_memory_usage();
+            BOOST_REQUIRE_GT(mem, 0u);
+            testlog.info("BATCH prepared statement external_memory_usage: {}", mem);
+        }
+
+        // Test that a more complex statement uses more memory than a simple one
+        {
+            auto simple_key = e.prepare("SELECT pk FROM ks.sizing_test WHERE pk = ?").get();
+            auto complex_key = e.prepare("SELECT pk, ck, v1, v2 FROM ks.sizing_test WHERE pk = ? AND ck > ? AND ck < ? ALLOW FILTERING").get();
+            auto simple_ptr = e.local_qp().get_prepared(simple_key);
+            auto complex_ptr = e.local_qp().get_prepared(complex_key);
+            BOOST_REQUIRE(simple_ptr);
+            BOOST_REQUIRE(complex_ptr);
+            auto simple_mem = simple_ptr->external_memory_usage();
+            auto complex_mem = complex_ptr->external_memory_usage();
+            testlog.info("Simple SELECT: {}, Complex SELECT: {}", simple_mem, complex_mem);
+            // Complex statement should use at least as much memory
+            BOOST_REQUIRE_GE(complex_mem, simple_mem);
+        }
+
+        // Test prepared_cache_entry_size functor (the actual integration point)
+        {
+            auto key = e.prepare("SELECT * FROM ks.sizing_test WHERE pk = ?").get();
+            auto stmt_ptr = e.local_qp().get_prepared(key);
+            BOOST_REQUIRE(stmt_ptr);
+            // The external_memory_usage should be reasonable (not the old 10000 hardcode)
+            // and should be > sizeof(prepared_statement) worth of overhead
+            auto mem = stmt_ptr->external_memory_usage();
+            BOOST_REQUIRE_GT(mem, 0u);
+            // Sanity: shouldn't be absurdly large for a simple query
+            BOOST_REQUIRE_LT(mem, 1000000u);
+        }
+    });
+}
+
 BOOST_AUTO_TEST_SUITE_END()

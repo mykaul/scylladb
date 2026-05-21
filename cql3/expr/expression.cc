@@ -10,6 +10,8 @@
 
 #include "cql3/expr/evaluate.hh"
 #include "cql3/expr/expr-utils.hh"
+#include "cql3/column_specification.hh"
+#include "cql3/memory_usage.hh"
 
 #include <seastar/core/on_internal_error.hh>
 
@@ -2549,6 +2551,112 @@ convert_extended_property_map(const collection_constructor& map, error_sink_fn a
         }
     }
     return res;
+}
+
+static size_t column_spec_external_memory_usage(const lw_shared_ptr<column_specification>& cs) noexcept {
+    if (!cs) {
+        return 0;
+    }
+    size_t s = sizeof(column_specification);
+    s += sstring_external_memory_usage(cs->ks_name);
+    s += sstring_external_memory_usage(cs->cf_name);
+    if (cs->name) {
+        s += sizeof(column_identifier);
+        s += basic_sstring_external_memory_usage(cs->name->bytes_);
+        s += sstring_external_memory_usage(cs->name->text());
+    }
+    return s;
+}
+
+size_t expression::external_memory_usage() const {
+    if (!_v) {
+        return 0;
+    }
+    size_t base = sizeof(impl);
+    size_t payload = std::visit(overloaded_functor{
+        [](const conjunction& e) -> size_t {
+            size_t s = vector_external_memory_usage(e.children);
+            for (const auto& child : e.children) {
+                s += child.external_memory_usage();
+            }
+            return s;
+        },
+        [](const binary_operator& e) -> size_t {
+            return e.lhs.external_memory_usage() + e.rhs.external_memory_usage();
+        },
+        [](const column_value&) -> size_t {
+            return 0;
+        },
+        [](const subscript& e) -> size_t {
+            return e.val.external_memory_usage() + e.sub.external_memory_usage();
+        },
+        [](const unresolved_identifier&) -> size_t {
+            return 0;
+        },
+        [](const column_mutation_attribute& e) -> size_t {
+            return e.column.external_memory_usage();
+        },
+        [](const function_call& e) -> size_t {
+            size_t s = vector_external_memory_usage(e.args);
+            for (const auto& arg : e.args) {
+                s += arg.external_memory_usage();
+            }
+            // function_name has two sstrings; shared_ptr variant is shared, don't count
+            if (auto* fname = std::get_if<functions::function_name>(&e.func)) {
+                s += sstring_external_memory_usage(fname->keyspace);
+                s += sstring_external_memory_usage(fname->name);
+            }
+            return s;
+        },
+        [](const cast& e) -> size_t {
+            return e.arg.external_memory_usage();
+        },
+        [](const field_selection& e) -> size_t {
+            return e.structure.external_memory_usage();
+        },
+        [](const bind_variable& e) -> size_t {
+            return column_spec_external_memory_usage(e.receiver);
+        },
+        [](const untyped_constant& e) -> size_t {
+            return sstring_external_memory_usage(e.raw_text);
+        },
+        [](const constant& e) -> size_t {
+            if (e.value.is_null()) {
+                return 0;
+            }
+            return e.value.view().size_bytes();
+        },
+        [](const tuple_constructor& e) -> size_t {
+            size_t s = vector_external_memory_usage(e.elements);
+            for (const auto& elem : e.elements) {
+                s += elem.external_memory_usage();
+            }
+            return s;
+        },
+        [](const collection_constructor& e) -> size_t {
+            size_t s = vector_external_memory_usage(e.elements);
+            for (const auto& elem : e.elements) {
+                s += elem.external_memory_usage();
+            }
+            return s;
+        },
+        [](const usertype_constructor& e) -> size_t {
+            // Per-node overhead for std::unordered_map: next pointer + bucket pointer ≈ 2 pointers + padding.
+            // Platform-dependent; 32 is a conservative estimate for 64-bit systems.
+            constexpr size_t unordered_map_node_overhead = 32;
+            size_t s = e.elements.size() * (sizeof(typename usertype_constructor::elements_map_type::value_type) + unordered_map_node_overhead);
+            for (const auto& [id, expr] : e.elements) {
+                s += basic_sstring_external_memory_usage(id.bytes_);
+                s += sstring_external_memory_usage(id.text());
+                s += expr.external_memory_usage();
+            }
+            return s;
+        },
+        [](const temporary&) -> size_t {
+            return 0;
+        },
+    }, _v->v);
+    return base + payload;
 }
 
 } // namespace expr

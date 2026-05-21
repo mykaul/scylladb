@@ -14,6 +14,7 @@
 #include "service/raft/raft_group0_client.hh"
 #include "audit/audit.hh"
 
+
 namespace service {
 
 class storage_proxy;
@@ -119,6 +120,12 @@ public:
     void set_audit_info(audit::audit_info_ptr&& info) { _audit_info = std::move(info); }
 
     virtual void sanitize_audit_info() {}
+
+    /// Returns the actual size of the derived object.
+    virtual size_t object_size() const { return sizeof(*this); }
+
+    /// Returns heap memory owned by this statement beyond sizeof(*this).
+    virtual size_t external_memory_usage() const;
 };
 
 class cql_statement_no_metadata : public cql_statement {
