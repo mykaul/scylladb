@@ -1642,7 +1642,7 @@ process_execute_internal(service::client_state& client_state, sharded<cql3::quer
         if (!metadata_id_bytes) {
             return make_exception_future<cql_server::process_fn_return_type>(std::move(metadata_id_bytes).assume_error());
         }
-        metadata_id = cql_metadata_id_wrapper(cql3::cql_metadata_id_type(std::move(metadata_id_bytes).assume_value()), prepared->get_metadata_id());
+        metadata_id = cql_metadata_id_wrapper(cql3::cql_metadata_id_type(bytes_view(std::move(metadata_id_bytes).assume_value())), prepared->get_metadata_id());
     }
 
     auto q_state = std::make_unique<cql_query_state>(client_state, trace_state, std::move(permit));
@@ -2058,7 +2058,7 @@ public:
         _response.write_int(0x0004);
         _response.write_short_bytes(m.get_id());
         if (_metadata_id.has_response_metadata_id()) {
-            _response.write_short_bytes(_metadata_id.get_response_metadata_id()._metadata_id);
+            _response.write_short_bytes(_metadata_id.get_response_metadata_id().to_bytes());
         }
         _response.write(m.metadata(), _version);
         _response.write(*m.result_metadata(), _metadata_id);
@@ -2585,7 +2585,7 @@ void cql_server::response::write(const cql3::metadata& m, const cql_metadata_id_
     }
 
     if (flags.contains<cql3::metadata::flag::METADATA_CHANGED>()) {
-        write_short_bytes(metadata_id.get_response_metadata_id()._metadata_id);
+        write_short_bytes(metadata_id.get_response_metadata_id().to_bytes());
     }
 
     auto names_i = m.get_names().begin();

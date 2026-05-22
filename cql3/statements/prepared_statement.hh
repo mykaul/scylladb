@@ -15,6 +15,7 @@
 #include <seastar/core/shared_ptr.hh>
 #include <seastar/core/weak_ptr.hh>
 #include <seastar/core/checked_ptr.hh>
+#include <array>
 #include <vector>
 
 #include "exceptions/exceptions.hh"
@@ -27,10 +28,24 @@ class column_specification;
 class cql_statement;
 
 struct cql_metadata_id_type {
-    explicit cql_metadata_id_type(bytes&& metadata_id) : _metadata_id(std::move(metadata_id)) {}
-    bytes _metadata_id;
+    static constexpr size_t size = 16;
+    std::array<uint8_t, size> _id = {};
+
+    cql_metadata_id_type() = default;
+    explicit cql_metadata_id_type(bytes_view metadata_id) {
+        if (metadata_id.size() != size) {
+            throw exceptions::protocol_exception(
+                fmt::format("Expected metadata_id of {} bytes, got {}", size, metadata_id.size()));
+        }
+        std::copy_n(metadata_id.begin(), size, _id.begin());
+    }
 
     bool operator==(const cql_metadata_id_type& other) const = default;
+
+    // For wire protocol: convert to bytes for write_short_bytes
+    bytes to_bytes() const {
+        return bytes(reinterpret_cast<const bytes::value_type*>(_id.data()), size);
+    }
 };
 
 namespace statements {
@@ -80,6 +95,6 @@ public:
 template <> struct fmt::formatter<cql3::cql_metadata_id_type> {
     constexpr auto parse(format_parse_context& ctx) { return ctx.begin(); }
     auto format(const cql3::cql_metadata_id_type& m, fmt::format_context& ctx) const {
-        return fmt::format_to(ctx.out(), "{}", m._metadata_id);
+        return fmt::format_to(ctx.out(), "{}", m.to_bytes());
     }
 };
