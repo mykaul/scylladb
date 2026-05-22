@@ -36,7 +36,7 @@ operation::set_element::to_string(const column_definition& receiver) const {
     return format("{}[{}] = {}", receiver.name_as_text(), _selector, _value);
 }
 
-shared_ptr<operation>
+std::unique_ptr<operation>
 operation::set_element::prepare(data_dictionary::database db, const sstring& keyspace, const column_definition& receiver) const {
     using exceptions::invalid_request_exception;
     auto rtype = dynamic_pointer_cast<const collection_type_impl>(receiver.type);
@@ -52,11 +52,11 @@ operation::set_element::prepare(data_dictionary::database db, const sstring& key
         if (_by_uuid) {
             auto&& idx = prepare_expression(_selector, db, keyspace, nullptr, lists::uuid_index_spec_of(*receiver.column_specification));
             verify_no_aggregate_functions(idx, "SET clause");
-            return make_shared<lists::setter_by_uuid>(receiver, std::move(idx), std::move(lval));
+            return std::make_unique<lists::setter_by_uuid>(receiver, std::move(idx), std::move(lval));
         } else {
             auto&& idx = prepare_expression(_selector, db, keyspace, nullptr, lists::index_spec_of(*receiver.column_specification));
             verify_no_aggregate_functions(idx, "SET clause");
-            return make_shared<lists::setter_by_index>(receiver, std::move(idx), std::move(lval));
+            return std::make_unique<lists::setter_by_index>(receiver, std::move(idx), std::move(lval));
         }
     } else if (rtype->get_kind() == abstract_type::kind::set) {
         throw invalid_request_exception(format("Invalid operation ({}) for set column {}", to_string(receiver), receiver.name_as_text()));
@@ -65,7 +65,7 @@ operation::set_element::prepare(data_dictionary::database db, const sstring& key
         verify_no_aggregate_functions(key, "SET clause");
         auto mval = prepare_expression(_value, db, keyspace, nullptr, maps::value_spec_of(*receiver.column_specification));
         verify_no_aggregate_functions(mval, "SET clause");
-        return make_shared<maps::setter_by_key>(receiver, std::move(key), std::move(mval));
+        return std::make_unique<maps::setter_by_key>(receiver, std::move(key), std::move(mval));
     }
     throwing_assert(0 && "prepare set_element collection type");
 }
@@ -82,7 +82,7 @@ operation::set_field::to_string(const column_definition& receiver) const {
     return format("{}.{} = {}", receiver.name_as_text(), *_field, _value);
 }
 
-shared_ptr<operation>
+std::unique_ptr<operation>
 operation::set_field::prepare(data_dictionary::database db, const sstring& keyspace, const column_definition& receiver) const {
     if (!receiver.type->is_user_type()) {
         throw exceptions::invalid_request_exception(
@@ -101,7 +101,7 @@ operation::set_field::prepare(data_dictionary::database db, const sstring& keysp
 
     auto val = prepare_expression(_value, db, keyspace, nullptr, user_types::field_spec_of(*receiver.column_specification, *idx));
     verify_no_aggregate_functions(val, "SET clause");
-    return make_shared<user_types::setter_by_field>(receiver, *idx, std::move(val));
+    return std::make_unique<user_types::setter_by_field>(receiver, *idx, std::move(val));
 }
 
 bool
@@ -119,7 +119,7 @@ operation::field_deletion::affected_column() const {
     return *_id;
 }
 
-shared_ptr<operation>
+std::unique_ptr<operation>
 operation::field_deletion::prepare(data_dictionary::database db, const sstring& keyspace, const column_definition& receiver) const {
     if (!receiver.type->is_user_type()) {
         throw exceptions::invalid_request_exception(
@@ -136,7 +136,7 @@ operation::field_deletion::prepare(data_dictionary::database db, const sstring& 
                 format("UDT column {} does not have a field named {}", receiver.name_as_text(), *_field));
     }
 
-    return make_shared<user_types::deleter_by_field>(receiver, *idx);
+    return std::make_unique<user_types::deleter_by_field>(receiver, *idx);
 }
 
 sstring
@@ -144,7 +144,7 @@ operation::addition::to_string(const column_definition& receiver) const {
     return format("{} = {} + {}", receiver.name_as_text(), receiver.name_as_text(), _value);
 }
 
-shared_ptr<operation>
+std::unique_ptr<operation>
 operation::addition::prepare(data_dictionary::database db, const sstring& keyspace, const column_definition& receiver) const {
     auto v = prepare_expression(_value, db, keyspace, nullptr, receiver.column_specification);
     verify_no_aggregate_functions(v, "SET clause");
@@ -154,17 +154,17 @@ operation::addition::prepare(data_dictionary::database db, const sstring& keyspa
         if (!receiver.is_counter()) {
             throw exceptions::invalid_request_exception(format("Invalid operation ({}) for non counter column {}", to_string(receiver), receiver.name_as_text()));
         }
-        return make_shared<constants::adder>(receiver, std::move(v));
+        return std::make_unique<constants::adder>(receiver, std::move(v));
     } else if (!ctype->is_multi_cell()) {
         throw exceptions::invalid_request_exception(format("Invalid operation ({}) for frozen collection column {}", to_string(receiver), receiver.name_as_text()));
     }
 
     if (ctype->get_kind() == abstract_type::kind::list) {
-        return make_shared<lists::appender>(receiver, std::move(v));
+        return std::make_unique<lists::appender>(receiver, std::move(v));
     } else if (ctype->get_kind() == abstract_type::kind::set) {
-        return make_shared<sets::adder>(receiver, std::move(v));
+        return std::make_unique<sets::adder>(receiver, std::move(v));
     } else if (ctype->get_kind() == abstract_type::kind::map) {
-        return make_shared<maps::putter>(receiver, std::move(v));
+        return std::make_unique<maps::putter>(receiver, std::move(v));
     } else {
         throwing_assert(0 && "prepare addition collection type");
     }
@@ -180,7 +180,7 @@ operation::subtraction::to_string(const column_definition& receiver) const {
     return format("{} = {} - {}", receiver.name_as_text(), receiver.name_as_text(), _value);
 }
 
-shared_ptr<operation>
+std::unique_ptr<operation>
 operation::subtraction::prepare(data_dictionary::database db, const sstring& keyspace, const column_definition& receiver) const {
     auto ctype = dynamic_pointer_cast<const collection_type_impl>(receiver.type);
     if (!ctype) {
@@ -189,7 +189,7 @@ operation::subtraction::prepare(data_dictionary::database db, const sstring& key
         }
         auto v = prepare_expression(_value, db, keyspace, nullptr, receiver.column_specification);
         verify_no_aggregate_functions(v, "SET clause");
-        return make_shared<constants::subtracter>(receiver, std::move(v));
+        return std::make_unique<constants::subtracter>(receiver, std::move(v));
     }
     if (!ctype->is_multi_cell()) {
         throw exceptions::invalid_request_exception(
@@ -199,11 +199,11 @@ operation::subtraction::prepare(data_dictionary::database db, const sstring& key
     if (ctype->get_kind() == abstract_type::kind::list) {
         auto v = prepare_expression(_value, db, keyspace, nullptr, receiver.column_specification);
         verify_no_aggregate_functions(v, "SET clause");
-        return make_shared<lists::discarder>(receiver, std::move(v));
+        return std::make_unique<lists::discarder>(receiver, std::move(v));
     } else if (ctype->get_kind() == abstract_type::kind::set) {
         auto v = prepare_expression(_value, db, keyspace, nullptr, receiver.column_specification);
         verify_no_aggregate_functions(v, "SET clause");
-        return make_shared<sets::discarder>(receiver, std::move(v));
+        return std::make_unique<sets::discarder>(receiver, std::move(v));
     } else if (ctype->get_kind() == abstract_type::kind::map) {
         auto&& mtype = dynamic_pointer_cast<const map_type_impl>(ctype);
         // The value for a map subtraction is actually a set
@@ -214,7 +214,7 @@ operation::subtraction::prepare(data_dictionary::database db, const sstring& key
                 set_type_impl::get_instance(mtype->get_keys_type(), false));
         auto v = prepare_expression(_value, db, keyspace, nullptr, std::move(vr));
         verify_no_aggregate_functions(v, "SET clause");
-        return ::make_shared<sets::discarder>(receiver, std::move(v));
+        return std::make_unique<sets::discarder>(receiver, std::move(v));
     }
     throwing_assert(0 && "prepare subtraction collection type");
 }
@@ -229,7 +229,7 @@ operation::prepend::to_string(const column_definition& receiver) const {
     return format("{} = {} + {}", receiver.name_as_text(), _value, receiver.name_as_text());
 }
 
-shared_ptr<operation>
+std::unique_ptr<operation>
 operation::prepend::prepare(data_dictionary::database db, const sstring& keyspace, const column_definition& receiver) const {
     auto v = prepare_expression(_value, db, keyspace, nullptr, receiver.column_specification);
     verify_no_aggregate_functions(v, "SET clause");
@@ -240,7 +240,7 @@ operation::prepend::prepare(data_dictionary::database db, const sstring& keyspac
         throw exceptions::invalid_request_exception(format("Invalid operation ({}) for frozen list column {}", to_string(receiver), receiver.name_as_text()));
     }
 
-    return make_shared<lists::prepender>(receiver, std::move(v));
+    return std::make_unique<lists::prepender>(receiver, std::move(v));
 }
 
 bool
@@ -249,7 +249,7 @@ operation::prepend::is_compatible_with(const std::unique_ptr<raw_update>& other)
 }
 
 
-::shared_ptr <operation>
+std::unique_ptr<operation>
 operation::set_value::prepare(data_dictionary::database db, const sstring& keyspace, const column_definition& receiver) const {
     auto v = prepare_expression(_value, db, keyspace, nullptr, receiver.column_specification);
     verify_no_aggregate_functions(v, "SET clause");
@@ -261,24 +261,24 @@ operation::set_value::prepare(data_dictionary::database db, const sstring& keysp
     if (receiver.type->is_collection()) {
         auto k = receiver.type->get_kind();
         if (k == abstract_type::kind::list) {
-            return make_shared<lists::setter>(receiver, std::move(v));
+            return std::make_unique<lists::setter>(receiver, std::move(v));
         } else if (k == abstract_type::kind::set) {
-            return make_shared<sets::setter>(receiver, std::move(v));
+            return std::make_unique<sets::setter>(receiver, std::move(v));
         } else if (k == abstract_type::kind::map) {
-            return make_shared<maps::setter>(receiver, std::move(v));
+            return std::make_unique<maps::setter>(receiver, std::move(v));
         } else {
             throwing_assert(0 && "prepare set_value collection type");
         }
     }
 
     if (receiver.type->is_user_type()) {
-        return make_shared<user_types::setter>(receiver, std::move(v));
+        return std::make_unique<user_types::setter>(receiver, std::move(v));
     }
 
-    return ::make_shared<constants::setter>(receiver, std::move(v));
+    return std::make_unique<constants::setter>(receiver, std::move(v));
 }
 
-::shared_ptr <operation>
+std::unique_ptr<operation>
 operation::set_counter_value_from_tuple_list::prepare(data_dictionary::database db, const sstring& keyspace, const column_definition& receiver) const {
     static thread_local const data_type counter_tuple_type = tuple_type_impl::get_instance({int32_type, uuid_type, long_type, long_type});
     static thread_local const data_type counter_tuple_list_type = list_type_impl::get_instance(counter_tuple_type, true);
@@ -349,7 +349,7 @@ operation::set_counter_value_from_tuple_list::prepare(data_dictionary::database 
         }
     };
 
-    return make_shared<counter_setter>(receiver, std::move(v));
+    return std::make_unique<counter_setter>(receiver, std::move(v));
 };
 
 bool
@@ -364,7 +364,7 @@ operation::element_deletion::affected_column() const {
     return *_id;
 }
 
-shared_ptr<operation>
+std::unique_ptr<operation>
 operation::element_deletion::prepare(data_dictionary::database db, const sstring& keyspace, const column_definition& receiver) const {
     if (!receiver.type->is_collection()) {
         throw exceptions::invalid_request_exception(format("Invalid deletion operation for non collection column {}", receiver.name_as_text()));
@@ -375,15 +375,15 @@ operation::element_deletion::prepare(data_dictionary::database db, const sstring
     if (ctype->get_kind() == abstract_type::kind::list) {
         auto&& idx = prepare_expression(_element, db, keyspace, nullptr, lists::index_spec_of(*receiver.column_specification));
         verify_no_aggregate_functions(idx, "SET clause");
-        return make_shared<lists::discarder_by_index>(receiver, std::move(idx));
+        return std::make_unique<lists::discarder_by_index>(receiver, std::move(idx));
     } else if (ctype->get_kind() == abstract_type::kind::set) {
         auto&& elt = prepare_expression(_element, db, keyspace, nullptr, sets::value_spec_of(*receiver.column_specification));
         verify_no_aggregate_functions(elt, "SET clause");
-        return make_shared<sets::element_discarder>(receiver, std::move(elt));
+        return std::make_unique<sets::element_discarder>(receiver, std::move(elt));
     } else if (ctype->get_kind() == abstract_type::kind::map) {
         auto&& key = prepare_expression(_element, db, keyspace, nullptr, maps::key_spec_of(*receiver.column_specification));
         verify_no_aggregate_functions(key, "SET clause");
-        return make_shared<maps::discarder_by_key>(receiver, std::move(key));
+        return std::make_unique<maps::discarder_by_key>(receiver, std::move(key));
     }
     throwing_assert(0 && "prepare element_deletion collection type");
 }
