@@ -59,7 +59,7 @@ private:
     // of a schema if we have IF EXISTS/IF NOT EXISTS. Does *not*
     // contain LIST columns prefetched to apply updates, unless
     // these columns are also used in conditions.
-    column_set _columns_of_cas_result_set;
+    std::unique_ptr<column_set> _columns_of_cas_result_set;
 public:
     const schema_ptr s;
     const std::unique_ptr<attributes> attrs;
@@ -191,7 +191,7 @@ public:
 
     // Columns of the statement result set (only CAS statement
     // returns a result set).
-    const column_set& columns_of_cas_result_set() const { return _columns_of_cas_result_set; }
+    const column_set& columns_of_cas_result_set() const { return *_columns_of_cas_result_set; }
 
     // Build a read_command instance to fetch the previous mutation from storage. The mutation is
     // fetched if we need to check LWT conditions or apply updates to non-frozen list elements.

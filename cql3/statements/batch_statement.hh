@@ -67,7 +67,7 @@ private:
     // Cassandra returns a result set only if CAS succeeds. If
     // any statement in the batch has IF EXISTS, we must return
     // all columns of the table, including the primary key.
-    column_set _columns_of_cas_result_set;
+    std::unique_ptr<column_set> _columns_of_cas_result_set;
     cql_stats& _stats;
 public:
     /**
