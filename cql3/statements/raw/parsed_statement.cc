@@ -105,8 +105,7 @@ size_t prepared_statement::external_memory_usage() const {
         s += sstring_external_memory_usage(w);
     }
 
-    // _metadata_id
-    s += basic_sstring_external_memory_usage(_metadata_id._metadata_id);
+    // _metadata_id: std::array<uint8_t, 16>, no external memory
 
     // statement (the cql_statement itself)
     if (statement) {

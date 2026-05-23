@@ -874,8 +874,8 @@ const statement_type statement_type::SELECT = statement_type(statement_type::typ
 size_t modification_statement::external_memory_usage() const {
     size_t s = cql_statement::external_memory_usage();
 
-    // _column_operations: vector of shared_ptr<operation>
-    s += _column_operations.capacity() * sizeof(::shared_ptr<operation>);
+    // _column_operations: vector of unique_ptr<operation>
+    s += _column_operations.capacity() * sizeof(std::unique_ptr<operation>);
     for (const auto& op : _column_operations) {
         if (op) {
             s += sizeof(operation) + op->external_memory_usage();
@@ -893,6 +893,18 @@ size_t modification_statement::external_memory_usage() const {
     // attrs
     if (attrs) {
         s += sizeof(attributes) + attrs->external_memory_usage();
+    }
+
+    // _columns_to_read: lazily allocated column_set
+    // sizeof(column_set) covers the dynamic_bitset struct; its internal heap buffer
+    // is small (ceil(column_count/64) * 8 bytes) and not easily accessible.
+    if (_columns_to_read) {
+        s += sizeof(column_set);
+    }
+
+    // _columns_of_cas_result_set: lazily allocated column_set
+    if (_columns_of_cas_result_set) {
+        s += sizeof(column_set);
     }
 
     return s;

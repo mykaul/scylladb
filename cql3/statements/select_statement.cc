@@ -2997,7 +2997,11 @@ size_t select_statement::external_memory_usage() const {
 
     // Not counted (known approximations):
     // - _parameters: typically shared with _default_parameters (globally shared, not owned)
-    // - _ordering_comparator: std::function, usually fits in SBO for simple comparators
+
+    // _ordering_comparator: lazily allocated behind unique_ptr
+    if (_ordering_comparator) {
+        s += sizeof(ordering_comparator_type);
+    }
 
     return s;
 }

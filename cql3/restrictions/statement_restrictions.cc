@@ -21,6 +21,7 @@
 #include "cartesian_product.hh"
 
 #include "cql3/cql_config.hh"
+#include "cql3/memory_usage.hh"
 #include "cql3/query_options.hh"
 #include "cql3/selection/selection.hh"
 #include "cql3/statements/request_validations.hh"
@@ -2818,6 +2819,23 @@ size_t statement_restrictions::external_memory_usage() const {
     s += _regular_columns_filter.external_memory_usage();
     s += _idx_restrictions.external_memory_usage();
 
+    // _idx_opt: lazily allocated secondary_index::index
+    if (_idx_opt) {
+        s += sizeof(secondary_index::index);
+        // index contains index_metadata (with sstring name + index_options_map) + sstring target_column
+        s += sstring_external_memory_usage(_idx_opt->target_column());
+        const auto& im = _idx_opt->metadata();
+        s += sstring_external_memory_usage(im.name());
+        for (const auto& [k, v] : im.options()) {
+            s += sstring_external_memory_usage(k) + sstring_external_memory_usage(v);
+        }
+    }
+
+    // _index_fns: lazily allocated behind unique_ptr
+    if (_index_fns) {
+        s += sizeof(index_query_fns);
+    }
+
     s += expression_map_external_memory_usage(_single_column_partition_key_restrictions);
     s += expression_map_external_memory_usage(_single_column_clustering_key_restrictions);
     s += expression_map_external_memory_usage(_single_column_nonprimary_key_restrictions);
@@ -2856,14 +2874,16 @@ size_t statement_restrictions::external_memory_usage() const {
         },
     }, _partition_range_restrictions);
 
-    s += _not_null_columns.bucket_count() * sizeof(void*);
-    s += _not_null_columns.size() * (sizeof(const column_definition*) + sizeof(void*));
-    s += _columns_with_eq.bucket_count() * sizeof(void*);
-    s += _columns_with_eq.size() * (sizeof(const column_definition*) + sizeof(void*));
+    s += _not_null_columns ? sizeof(std::unordered_set<const column_definition*>)
+            + _not_null_columns->bucket_count() * sizeof(void*)
+            + _not_null_columns->size() * (sizeof(const column_definition*) + sizeof(void*))
+        : 0;
+    s += _columns_with_eq.capacity() * sizeof(const column_definition*);
 
     s += _column_defs_for_filtering.capacity() * sizeof(const column_definition*);
 
-    // std::function fields — assume SBO, not counted
+    // Index query functions are behind unique_ptr<index_query_fns>, already counted above.
+    // _get_partition_key_ranges_fn: std::function, assume SBO, not counted.
 
     return s;
 }
