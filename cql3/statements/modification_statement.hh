@@ -52,7 +52,7 @@ private:
     // columns, to match Cassandra behaviour.
     // This bitset contains a mask of ordinal_id identifiers
     // of the required columns.
-    column_set _columns_to_read;
+    std::unique_ptr<column_set> _columns_to_read;
     // A CAS statement returns a result set with the columns
     // used in condition expression. This is a mask of ordinal_id
     // identifiers of the required columns. Contains all columns
@@ -187,7 +187,7 @@ public:
     bool requires_read() const { return _requires_read; }
 
     // Columns used in this statement conditions or operations.
-    const column_set& columns_to_read() const { return _columns_to_read; }
+    const column_set& columns_to_read() const { return *_columns_to_read; }
 
     // Columns of the statement result set (only CAS statement
     // returns a result set).
