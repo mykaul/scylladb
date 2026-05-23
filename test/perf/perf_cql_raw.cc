@@ -69,6 +69,7 @@ struct raw_cql_test_config {
     bool create_non_superuser = false;
     unsigned tables = 1;
     std::string json_result_file;
+    bool varied_queries = false; // prepare diverse statement types per table
 };
 
 } // namespace perf
@@ -82,7 +83,8 @@ struct fmt::formatter<perf::raw_cql_test_config> {
             (c.username.empty() ? "" : ", auth"),
             (c.connection_per_request ? ", connection_per_request" : ""),
             (c.use_prepared ? ", use_prepared" : ""),
-            (c.create_non_superuser ? ", create_non_superuser" : ""));
+            (c.create_non_superuser ? ", create_non_superuser" : ""),
+            (c.varied_queries ? ", varied_queries" : ""));
     }
 };
 
@@ -152,6 +154,12 @@ static sstring make_key(uint64_t seq) {
     return b;
 }
 
+static sstring make_int_value(int32_t v) {
+    sstring b(sstring::initialized_later(), sizeof(v));
+    write_be<int32_t>(b.begin(), v);
+    return b;
+}
+
 static sstring to_hex(std::string_view b) {
     static const char* digits = "0123456789abcdef";
     sstring r;
@@ -172,8 +180,15 @@ class raw_cql_connection {
     sstring _username;
     sstring _password;
     bool _use_prepared = false;
+    bool _varied_queries = false;
     std::vector<sstring> _read_stmt_ids;
     std::vector<sstring> _write_stmt_ids;
+    // Varied query statement IDs (one per table when --varied-queries is set)
+    std::vector<sstring> _lwt_insert_ids;      // INSERT IF NOT EXISTS
+    std::vector<sstring> _lwt_update_ids;      // UPDATE IF c0 = ?
+    std::vector<sstring> _range_read_ids;      // SELECT ... WHERE pk = ? AND ck >= ? AND ck < ?
+    std::vector<sstring> _index_read_ids;      // SELECT ... WHERE c0 = ? (secondary index)
+    std::vector<sstring> _delete_ids;          // DELETE ... WHERE pk = ? AND ck = ?
 
     struct frame {
         cql_binary_opcode opcode;
@@ -188,8 +203,8 @@ class raw_cql_connection {
     int16_t _next_new_stream = 0;
 
 public:
-    raw_cql_connection(connected_socket cs, sstring username = {}, sstring password = {}, bool use_prepared = false)
-        : _cs(std::move(cs)), _in(_cs.input()), _out(_cs.output()), _username(std::move(username)), _password(std::move(password)), _use_prepared(use_prepared) {
+    raw_cql_connection(connected_socket cs, sstring username = {}, sstring password = {}, bool use_prepared = false, bool varied_queries = false)
+        : _cs(std::move(cs)), _in(_cs.input()), _out(_cs.output()), _username(std::move(username)), _password(std::move(password)), _use_prepared(use_prepared), _varied_queries(varied_queries) {
         start_reader();
     }
 
@@ -440,20 +455,78 @@ public:
         }
     }
 
+    // Execute a prepared statement with two bind values
+    future<> execute_prepared_multi(const sstring& id, std::string_view v1, std::string_view v2) {
+        auto stream = allocate_stream();
+        frame_builder fb{stream};
+        fb.write_string(id);
+        fb.write_short(0x0001); // ONE
+        fb.write_byte(0x03); // VALUES | SKIP_METADATA
+        fb.write_short(2); // 2 values
+        fb.write_int(v1.size());
+        fb.write_raw(v1.data(), v1.size());
+        fb.write_int(v2.size());
+        fb.write_raw(v2.data(), v2.size());
+
+        auto f = co_await execute_request(stream, fb.finish(cql_binary_opcode::EXECUTE));
+        if (f.opcode == cql_binary_opcode::ERROR) {
+            throw std::runtime_error("server returned ERROR to EXECUTE (multi)");
+        }
+    }
+
+    // Execute a prepared statement with three bind values
+    future<> execute_prepared_three(const sstring& id, std::string_view v1, std::string_view v2, std::string_view v3) {
+        auto stream = allocate_stream();
+        frame_builder fb{stream};
+        fb.write_string(id);
+        fb.write_short(0x0001); // ONE
+        fb.write_byte(0x03); // VALUES | SKIP_METADATA
+        fb.write_short(3); // 3 values
+        fb.write_int(v1.size());
+        fb.write_raw(v1.data(), v1.size());
+        fb.write_int(v2.size());
+        fb.write_raw(v2.data(), v2.size());
+        fb.write_int(v3.size());
+        fb.write_raw(v3.data(), v3.size());
+
+        auto f = co_await execute_request(stream, fb.finish(cql_binary_opcode::EXECUTE));
+        if (f.opcode == cql_binary_opcode::ERROR) {
+            throw std::runtime_error("server returned ERROR to EXECUTE (three)");
+        }
+    }
+
     future<> prepare_statements(unsigned tables) {
         if (!_use_prepared) {
             co_return;
         }
         for (unsigned i = 0; i < tables; ++i) {
-            _write_stmt_ids.push_back(co_await prepare_query(fmt::format("INSERT INTO ks.cf{}(pk,c0,c1,c2,c3,c4) VALUES (?,0x01,0x02,0x03,0x04,0x05)", i)));
-            _read_stmt_ids.push_back(co_await prepare_query(fmt::format("SELECT * FROM ks.cf{} WHERE pk=?", i)));
+            if (_varied_queries) {
+                // Rich schema: pk blob, ck int, c0 blob, c1 blob, c2 blob, c3 blob, c4 blob
+                // With secondary index on c0
+                _write_stmt_ids.push_back(co_await prepare_query(fmt::format("INSERT INTO ks.cf{}(pk,ck,c0,c1,c2,c3,c4) VALUES (?,?,0x01,0x02,0x03,0x04,0x05)", i)));
+                _read_stmt_ids.push_back(co_await prepare_query(fmt::format("SELECT * FROM ks.cf{} WHERE pk=? AND ck=?", i)));
+                _lwt_insert_ids.push_back(co_await prepare_query(fmt::format("INSERT INTO ks.cf{}(pk,ck,c0,c1,c2,c3,c4) VALUES (?,?,0x01,0x02,0x03,0x04,0x05) IF NOT EXISTS", i)));
+                _lwt_update_ids.push_back(co_await prepare_query(fmt::format("UPDATE ks.cf{} SET c1=0x99 WHERE pk=? AND ck=? IF c0=0x01", i)));
+                _range_read_ids.push_back(co_await prepare_query(fmt::format("SELECT * FROM ks.cf{} WHERE pk=? AND ck>=? AND ck<?", i)));
+                _index_read_ids.push_back(co_await prepare_query(fmt::format("SELECT * FROM ks.cf{} WHERE c0=?", i)));
+                _delete_ids.push_back(co_await prepare_query(fmt::format("DELETE FROM ks.cf{} WHERE pk=? AND ck=?", i)));
+            } else {
+                _write_stmt_ids.push_back(co_await prepare_query(fmt::format("INSERT INTO ks.cf{}(pk,c0,c1,c2,c3,c4) VALUES (?,0x01,0x02,0x03,0x04,0x05)", i)));
+                _read_stmt_ids.push_back(co_await prepare_query(fmt::format("SELECT * FROM ks.cf{} WHERE pk=?", i)));
+            }
         }
     }
 
     future<> write_one(unsigned table_idx, uint64_t seq) {
         auto key = make_key(seq);
         if (_use_prepared) {
-            co_await execute_prepared(_write_stmt_ids[table_idx], key);
+            if (_varied_queries) {
+                // For varied schema, write needs pk + ck
+                auto ck = make_int_value(static_cast<int32_t>(seq % 100));
+                co_await execute_prepared_multi(_write_stmt_ids[table_idx], key, ck);
+            } else {
+                co_await execute_prepared(_write_stmt_ids[table_idx], key);
+            }
         } else {
             auto key_hex = to_hex(key);
             co_await query_simple(fmt::format("INSERT INTO ks.cf{}(pk,c0,c1,c2,c3,c4) VALUES (0x{},0x01,0x02,0x03,0x04,0x05)", table_idx, key_hex));
@@ -463,21 +536,72 @@ public:
     future<> read_one(unsigned table_idx, uint64_t seq) {
         auto key = make_key(seq);
         if (_use_prepared) {
-            co_await execute_prepared(_read_stmt_ids[table_idx], key);
+            if (_varied_queries) {
+                auto ck = make_int_value(static_cast<int32_t>(seq % 100));
+                co_await execute_prepared_multi(_read_stmt_ids[table_idx], key, ck);
+            } else {
+                co_await execute_prepared(_read_stmt_ids[table_idx], key);
+            }
         } else {
             auto key_hex = to_hex(key);
             co_await query_simple(fmt::format("SELECT * FROM ks.cf{} WHERE pk=0x{}", table_idx, key_hex));
         }
     }
+
+    // Execute a deterministic round-robin varied query type against the given table
+    future<> varied_request(unsigned table_idx, uint64_t seq) {
+        auto key = make_key(seq);
+        auto ck = make_int_value(static_cast<int32_t>(seq % 100));
+        // Deterministic round-robin over 7 statement types
+        static thread_local unsigned rr_counter = 0;
+        auto choice = rr_counter++ % 7;
+        switch (choice) {
+        case 0:
+            co_await execute_prepared_multi(_write_stmt_ids[table_idx], key, ck);
+            break;
+        case 1:
+            co_await execute_prepared_multi(_read_stmt_ids[table_idx], key, ck);
+            break;
+        case 2:
+            co_await execute_prepared_multi(_lwt_insert_ids[table_idx], key, ck);
+            break;
+        case 3:
+            co_await execute_prepared_multi(_lwt_update_ids[table_idx], key, ck);
+            break;
+        case 4: {
+            auto ck2 = make_int_value(static_cast<int32_t>((seq % 100) + 10));
+            co_await execute_prepared_three(_range_read_ids[table_idx], key, ck, ck2);
+            break;
+        }
+        case 5:
+            co_await execute_prepared(_index_read_ids[table_idx], std::string_view("\x01", 1));
+            break;
+        case 6:
+            co_await execute_prepared_multi(_delete_ids[table_idx], key, ck);
+            break;
+        }
+    }
+
+    // Execute an index read (SELECT WHERE c0=?) — requires rich schema with secondary index
+    future<> index_read_one(unsigned table_idx, uint64_t seq) {
+        // c0 is always 0x01 in our writes, so this always finds rows
+        co_await execute_prepared(_index_read_ids[table_idx], std::string_view("\x01", 1));
+    }
 };
 
-static future<> ensure_schema(raw_cql_connection& conn, unsigned tables) {
+static future<> ensure_schema(raw_cql_connection& conn, const raw_cql_test_config& cfg) {
+    unsigned tables = cfg.tables;
     co_await conn.query_simple("CREATE KEYSPACE IF NOT EXISTS ks WITH replication={'class': 'NetworkTopologyStrategy'}");
     for (unsigned i = 0; i < tables; ++i) {
         if (tables > 100 && (i+1) % 100 == 0) {
              std::cout << "Creating schema in progress [" << i+1 << "/" << tables << "]" << std::endl;
         }
-        co_await conn.query_simple(fmt::format("CREATE TABLE IF NOT EXISTS ks.cf{} (pk blob primary key, c0 blob, c1 blob, c2 blob, c3 blob, c4 blob)", i));
+        if (cfg.varied_queries) {
+            co_await conn.query_simple(fmt::format("CREATE TABLE IF NOT EXISTS ks.cf{} (pk blob, ck int, c0 blob, c1 blob, c2 blob, c3 blob, c4 blob, PRIMARY KEY (pk, ck))", i));
+            co_await conn.query_simple(fmt::format("CREATE INDEX IF NOT EXISTS cf{}_c0_idx ON ks.cf{} (c0)", i, i));
+        } else {
+            co_await conn.query_simple(fmt::format("CREATE TABLE IF NOT EXISTS ks.cf{} (pk blob primary key, c0 blob, c1 blob, c2 blob, c3 blob, c4 blob)", i));
+        }
     }
 }
 
@@ -495,7 +619,7 @@ static constexpr std::string_view non_superuser_password = "perf_test_password";
 static std::unique_ptr<raw_cql_connection> make_connection(connected_socket cs, const raw_cql_test_config& cfg) {
     sstring username = cfg.create_non_superuser ? sstring(non_superuser_name) : sstring(cfg.username);
     sstring password = cfg.create_non_superuser ? sstring(non_superuser_password) : sstring(cfg.password);
-    return std::make_unique<raw_cql_connection>(std::move(cs), username, password, cfg.use_prepared);
+    return std::make_unique<raw_cql_connection>(std::move(cs), username, password, cfg.use_prepared, cfg.varied_queries);
 }
 
 // Perform one logical operation (write or read) using an existing connection.
@@ -503,8 +627,12 @@ static future<> do_request(raw_cql_connection& c, const raw_cql_test_config& cfg
     auto seq = tests::random::get_int<uint64_t>(cfg.partitions - 1);
     static thread_local unsigned table_idx = 0;
     unsigned t = table_idx++ % cfg.tables;
-    if (cfg.workload == "write") {
+    if (cfg.varied_queries) {
+        co_await c.varied_request(t, seq);
+    } else if (cfg.workload == "write") {
         co_await c.write_one(t, seq);
+    } else if (cfg.workload == "index") {
+        co_await c.index_read_one(t, seq);
     } else {
         co_await c.read_one(t, seq);
     }
@@ -634,7 +762,7 @@ static void prepopulate(const raw_cql_test_config& cfg) {
             raw_cql_connection superuser_conn(std::move(superuser_cs), sstring(cfg.username), sstring(cfg.password), false);
             try {
                 superuser_conn.startup().get();
-                ensure_schema(superuser_conn, cfg.tables).get();
+                ensure_schema(superuser_conn, cfg).get();
                 create_role_with_permissions(superuser_conn, non_superuser_name, non_superuser_password, cfg.tables).get();
             } catch (...) {
                 superuser_conn.stop().get();
@@ -663,7 +791,7 @@ static void prepopulate(const raw_cql_test_config& cfg) {
         try {
             conn->startup().get();
             if (!cfg.create_non_superuser) {
-                ensure_schema(*conn, cfg.tables).get();
+                ensure_schema(*conn, cfg).get();
             }
             conn->prepare_statements(cfg.tables).get();
             for (unsigned t = 0; t < cfg.tables; ++t) {
@@ -762,6 +890,7 @@ static void workload_main(const raw_cql_test_config& cfg, sharded<abort_source>*
         params["remote_host"] = cfg.remote_host;
         params["connection_per_request"] = cfg.connection_per_request;
         params["use_prepared"] = cfg.use_prepared;
+        params["varied_queries"] = cfg.varied_queries;
         params["create_non_superuser"] = cfg.create_non_superuser;
         params["cpus"] = smp::count;
 
@@ -782,7 +911,7 @@ std::function<int(int, char**)> perf_cql_raw(std::function<int(int, char**)> scy
         raw_cql_test_config c;
         bpo::options_description opts_desc;
         opts_desc.add_options()
-            ("workload", bpo::value<std::string>()->default_value("read"), "workload type: read|write|connect")
+            ("workload", bpo::value<std::string>()->default_value("read"), "workload type: read|write|connect|index")
             ("partitions", bpo::value<unsigned>()->default_value(10000), "number of partitions")
             ("tables", bpo::value<unsigned>()->default_value(1), "number of tables")
             ("duration", bpo::value<unsigned>()->default_value(5), "test duration seconds")
@@ -796,6 +925,7 @@ std::function<int(int, char**)> perf_cql_raw(std::function<int(int, char**)> scy
             ("remote-host", bpo::value<std::string>()->default_value(""), "remote host to connect to, leave empty to run in-process server")
             ("connection-per-request", bpo::value<bool>()->default_value(false), "create a fresh connection for every request")
             ("use-prepared", bpo::value<bool>()->default_value(true), "use prepared statements")
+            ("varied-queries", bpo::value<bool>()->default_value(false), "prepare diverse statement types (LWT, range, index) per table")
             ("json-result", bpo::value<std::string>()->default_value(""), "file to write json results to");
         bpo::variables_map vm;
         bpo::store(bpo::command_line_parser(ac,av).options(opts_desc).allow_unregistered().run(), vm);
@@ -814,6 +944,7 @@ std::function<int(int, char**)> perf_cql_raw(std::function<int(int, char**)> scy
         c.remote_host = vm["remote-host"].as<std::string>();
         c.connection_per_request = vm["connection-per-request"].as<bool>();
         c.use_prepared = vm["use-prepared"].as<bool>();
+        c.varied_queries = vm["varied-queries"].as<bool>();
         c.json_result_file = vm["json-result"].as<std::string>();
 
         if (!c.username.empty() && c.password.empty()) {
@@ -824,8 +955,18 @@ std::function<int(int, char**)> perf_cql_raw(std::function<int(int, char**)> scy
             std::cerr << "--create-non-superuser requires both --username and --password" << std::endl;
             return 1;
         }
-        if (c.workload != "read" && c.workload != "write" && c.workload != "connect") {
+        if (c.workload != "read" && c.workload != "write" && c.workload != "connect" && c.workload != "index") {
             std::cerr << "Unknown workload: " << c.workload << "\n"; return 1;
+        }
+        if (c.varied_queries && !c.use_prepared) {
+            std::cerr << "--varied-queries requires --use-prepared\n"; return 1;
+        }
+        // --workload index implies varied_queries for schema/prepare
+        if (c.workload == "index") {
+            c.varied_queries = true;
+            if (!c.use_prepared) {
+                std::cerr << "--workload index requires --use-prepared\n"; return 1;
+            }
         }
 
         // Remove test options to not disturb scylla main app
