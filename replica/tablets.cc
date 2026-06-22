@@ -8,6 +8,7 @@
 
 #include <fmt/ranges.h>
 #include <seastar/coroutine/maybe_yield.hh>
+#include <ranges>
 
 #include "types/types.hh"
 #include "types/tuple.hh"
@@ -290,9 +291,8 @@ tablet_map_to_mutations(const tablet_map& tablets, table_id id, const sstring& k
         }
     }
 
-    tablet_id tid = tablets.first_tablet();
     size_t tablets_in_mutation = 0;
-    for (auto&& tablet : tablets.tablets()) {
+    for (auto&& [tablet, tid] : std::views::zip(tablets.tablets(), tablets.tablet_ids())) {
         if (++tablets_in_mutation >= min_tablets_in_mutation && seastar::need_preempt()) {
             tablets_in_mutation = 0;
             co_await coroutine::maybe_yield();
@@ -332,10 +332,6 @@ tablet_map_to_mutations(const tablet_map& tablets, table_id id, const sstring& k
         if (tablets.has_raft_info()) {
             const auto& raft_info = tablets.get_tablet_raft_info(tid);
             m.set_clustered_cell(ck, "raft_group_id", raft_info.group_id.uuid(), ts);
-        }
-
-        if (auto next_tid = tablets.next_tablet(tid)) {
-            tid = *next_tid;
         }
     }
     co_await process_mutation(std::move(m));
