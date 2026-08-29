@@ -9,6 +9,7 @@
 #include <seastar/core/seastar.hh>
 #include <seastar/core/shard_id.hh>
 #include <seastar/core/coroutine.hh>
+#include <seastar/core/loop.hh>
 #include <seastar/core/with_scheduling_group.hh>
 #include <seastar/coroutine/maybe_yield.hh>
 #include <seastar/coroutine/exception.hh>
@@ -2308,6 +2309,9 @@ table::try_flush_memtable_to_sstable(compaction_group& cg, lw_shared_ptr<memtabl
         });
 
         co_await update_cache(cg, old, newtabs);
+        if (_config.enable_metrics_reporting) {
+            refresh_pending_compactions_stat();
+        }
 
         co_await utils::get_local_injector().inject("replica_post_flush_after_update_cache", [this] (auto& handler) -> future<> {
             const auto this_table_name = format("{}.{}", _schema->ks_name(), _schema->cf_name());
@@ -3048,6 +3052,35 @@ future<unsigned> table::estimate_pending_compactions() const {
     co_return ret;
 }
 
+void table::refresh_pending_compactions_stat() {
+    // estimate_pending_compactions() yields, so it must run detached from its (synchronous) call sites.
+    // A refresh already in flight absorbs this request instead of racing it (unserialized
+    // refreshes could otherwise let a stale estimate overwrite a fresher one).
+    _pending_compactions_refresh_requested = true;
+    if (_pending_compactions_refresh_in_progress || _async_gate.is_closed()) {
+        return;
+    }
+    _pending_compactions_refresh_in_progress = true;
+    (void)with_gate(_async_gate, [this] {
+        return do_until(
+                [this] {
+                    return !_pending_compactions_refresh_requested;
+                },
+                [this] {
+                    _pending_compactions_refresh_requested = false;
+                    return estimate_pending_compactions().then([this](unsigned pending) {
+                        _stats.pending_compactions = pending;
+                    });
+                })
+                .handle_exception([this](std::exception_ptr ex) {
+                    tlogger.debug("Failed to refresh pending_compactions stat of {}.{}: {}", _schema->ks_name(), _schema->cf_name(), ex);
+                })
+                .finally([this] {
+                    _pending_compactions_refresh_in_progress = false;
+                });
+    });
+}
+
 void compaction_group::set_compaction_strategy_state(compaction::compaction_strategy_state compaction_strategy_state) noexcept {
     _compaction_strategy_state = std::move(compaction_strategy_state);
 }
@@ -3457,6 +3490,9 @@ public:
         co_await _cg.update_sstable_sets_on_compaction_completion(std::move(desc));
         if (offstrategy) {
             _cg.trigger_compaction();
+        }
+        if (_t._config.enable_metrics_reporting) {
+            _t.refresh_pending_compactions_stat();
         }
     }
     bool is_auto_compaction_disabled_by_user() const noexcept override {
