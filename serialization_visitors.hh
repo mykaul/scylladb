@@ -72,6 +72,26 @@ inline frame<bytes_ostream> start_frame(bytes_ostream& out) {
     return frame<bytes_ostream> { size_ph, offset };
 }
 
+// A fixed-size class reserves its whole size once and serializes into the returned substream.
+template<typename Output>
+auto reserve_fixed_size(Output& out, size_t size) {
+    return out.write_substream(size);
+}
+
+inline seastar::simple_output_stream reserve_fixed_size(bytes_ostream& out, size_t size) {
+    return {reinterpret_cast<char*>(out.write_place_holder(size)), size};
+}
+
+inline seastar::measuring_output_stream reserve_fixed_size(seastar::measuring_output_stream& out, size_t size) {
+    out.write(nullptr, size);
+    return {};
+}
+
+template<typename Stream>
+bool fixed_size_filled(const Stream& s) {
+    return std::is_same_v<Stream, seastar::measuring_output_stream> || s.size() == 0;
+}
+
 template<typename Input>
 size_type read_frame_size(Input& in) {
     auto sz = deserialize(in, std::type_identity<size_type>());
