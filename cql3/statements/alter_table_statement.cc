@@ -387,10 +387,6 @@ std::pair<schema_ptr, std::vector<view_ptr>> alter_table_statement::prepare_sche
 
     auto cfm = schema_builder(s);
 
-    if (_properties->get_id()) {
-        throw exceptions::configuration_exception("Cannot alter table id.");
-    }
-
     auto cf = db.find_column_family(s);
     std::vector<view_ptr> view_updates;
 
@@ -449,7 +445,7 @@ std::pair<schema_ptr, std::vector<view_ptr>> alter_table_statement::prepare_sche
 
         {
             auto schema_extensions = _properties->make_schema_extensions(db.extensions());
-            _properties->validate(db, keyspace(), schema_extensions);
+            _properties->validate(db, keyspace(), schema_extensions, cf_prop_defs::is_alter::yes);
 
             if (!cf.views().empty() && _properties->get_gc_grace_seconds() == 0) {
                 throw exceptions::invalid_request_exception(
@@ -607,7 +603,7 @@ alter_table_statement::prepare_schema_mutations(query_processor& qp, const query
 
     if (_type == type::opts && _properties) {
         auto schema_extensions = _properties->make_schema_extensions(db.extensions());
-        _properties->validate(db, keyspace(), schema_extensions);
+        _properties->validate(db, keyspace(), schema_extensions, cf_prop_defs::is_alter::yes);
         const bool has_config_props = _properties->has_table_config_properties(db.features());
         const bool has_legacy_props = _properties->has_non_table_config_properties(db.features());
 
