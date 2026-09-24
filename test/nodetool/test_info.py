@@ -64,6 +64,7 @@ def normalize_output(output):
                          )
 def test_info(nodetool, display_all_tokens):
     host_id = 'hostid0'
+    endpoint = '127.0.0.1'
     generation_number = 42
     load = 42424242
     uptime = 12345
@@ -143,9 +144,13 @@ def test_info(nodetool, display_all_tokens):
                          response=join_ring))
 
     if join_ring:
-        expected_requests.append(
-            expected_request('GET', '/storage_service/tokens',
-                             response=tokens))
+        expected_requests += [
+            expected_request('GET', '/storage_service/host_id',
+                             response=[{'key': '127.0.0.2', 'value': 'hostid1'},
+                                       {'key': endpoint, 'value': host_id}]),
+            expected_request('GET', f'/storage_service/tokens/{endpoint}',
+                             response=tokens),
+        ]
 
     mem_used = 0.0
     mem_max = 0.0
