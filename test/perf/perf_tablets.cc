@@ -16,6 +16,7 @@
 #include <seastar/core/thread.hh>
 #include <seastar/core/reactor.hh>
 #include <seastar/util/defer.hh>
+#include <seastar/util/closeable.hh>
 
 #include "locator/tablets.hh"
 #include "replica/tablet_mutation_builder.hh"
@@ -297,6 +298,100 @@ static future<> test_basic_operations(app_template& app) {
     }, tablet_cql_test_config(app.configuration()["schema-commitlog-segment-size-mb"].as<unsigned>()));
 }
 
+// Times one TTL-scan pass's tablet search for one shard: the old walk over the
+// whole tablet map vs. probing only the tablets the shard hosts.
+static void test_ttl_tablet_search(app_template& app) {
+    const auto& cfg = app.configuration();
+    const int nr_tablets = cfg["tablets-per-table"].as<int>();
+    const int rf = cfg["rf"].as<int>();
+    const int nr_nodes = std::max(cfg["nodes"].as<int>(), rf);
+    const unsigned nr_shards = cfg["ttl-search-shards"].as<unsigned>();
+    const int rounds = cfg["ttl-search-rounds"].as<int>();
+
+    std::vector<host_id> nodes;
+    for (int i = 0; i < nr_nodes; ++i) {
+        nodes.push_back(host_id::create_random_id());
+    }
+    semaphore sem(1);
+    shared_token_metadata stm([&sem] () noexcept { return get_units(sem, 1); }, token_metadata::config{
+        topology::config{.this_host_id = nodes[0], .local_dc_rack = endpoint_dc_rack::default_location}});
+    auto stop_stm = deferred_stop(stm);
+    stm.mutate_token_metadata([&] (token_metadata& tm) -> future<> {
+        for (int i = 0; i < nr_nodes; ++i) {
+            tm.update_topology(nodes[i], endpoint_dc_rack{"dc1", format("rack{}", i % rf)}, node::state::normal, nr_shards);
+        }
+        co_return;
+    }).get();
+    const auto& topo = stm.get()->get_topology();
+
+    // Round-robin over nodes (one per rack); random shards, so primaries aren't correlated with shards.
+    std::mt19937 rng(0);
+    tablet_map tmap(nr_tablets);
+    for (tablet_id t : tmap.tablet_ids()) {
+        tablet_replica_set replicas;
+        for (int k = 0; k < rf; ++k) {
+            replicas.push_back({nodes[(size_t(t) * rf + k) % nr_nodes], shard_id(rng() % nr_shards)});
+        }
+        tmap.set_tablet(t, tablet_info{std::move(replicas)});
+    }
+
+    using clk = std::chrono::steady_clock;
+    using ms = std::chrono::duration<double, std::milli>;
+    const tablet_replica me{nodes[0], 0};
+    // As in scan_table() with all nodes up: the secondary replica is computed
+    // for every non-owned tablet, but only a primary stops the search.
+    volatile bool secondary_is_me = false;
+    auto probe = [&] (tablet_id t) {
+        if (tmap.get_primary_replica(t, topo) == me) {
+            return true;
+        }
+        if (tmap.get_tablet_info(t).replicas.size() > 1) {
+            secondary_is_me = tmap.get_secondary_replica(t, topo) == me;
+        }
+        return false;
+    };
+    std::vector<tablet_id> hosted;
+    for (tablet_id t : tmap.tablet_ids()) {
+        if (tmap.has_replica(t, me)) {
+            hosted.push_back(t);
+        }
+    }
+
+    // Old: walk from the resume point to the next owned tablet without
+    // yielding; the longest such walk is the longest stall / ERM hold.
+    double old_total = 0, old_stretch = 0, new_total = 0, new_stretch = 0;
+    size_t owned = 0;
+    for (int r = 0; r < rounds; ++r) {
+        auto pass_start = clk::now();
+        auto stretch_start = pass_start;
+        owned = 0;
+        for (tablet_id t : tmap.tablet_ids()) {
+            if (probe(t)) {
+                ++owned;
+                old_stretch = std::max(old_stretch, ms(clk::now() - stretch_start).count());
+                stretch_start = clk::now();
+            }
+        }
+        auto end = clk::now();
+        old_stretch = std::max(old_stretch, ms(end - stretch_start).count());
+        old_total += ms(end - pass_start).count();
+
+        pass_start = clk::now();
+        for (tablet_id t : hosted) {
+            auto probe_start = clk::now();
+            (void)probe(tmap.get_tablet_id(tmap.get_last_token(t)));
+            new_stretch = std::max(new_stretch, ms(clk::now() - probe_start).count());
+        }
+        new_total += ms(clk::now() - pass_start).count();
+        thread::maybe_yield();
+    }
+    fmt::print("ttl tablet search: tablets={} nodes={} shards={} rf={} hosted={} owned={}\n"
+               "old: {:.3f} ms/pass, longest non-yielding stretch {:.3f} ms, probes/pass {}\n"
+               "new: {:.3f} ms/pass, longest non-yielding stretch {:.3f} ms, probes/pass {}\n",
+               nr_tablets, nr_nodes, nr_shards, rf, hosted.size(), owned,
+               old_total / rounds, old_stretch, nr_tablets, new_total / rounds, new_stretch, hosted.size());
+}
+
 namespace perf {
 
 int scylla_tablets_main(int argc, char** argv) {
@@ -315,6 +410,9 @@ int scylla_tablets_main(int argc, char** argv) {
                     "Override schema_commitlog_segment_size_in_mb (0 = leave the default). The group0 raft "
                     "command size limit is roughly a quarter of this, so raising it allows applying larger "
                     "tablet metadata commands as a single command (see SCYLLADB-2856).")
+            ("ttl-search", "Benchmark the alternator TTL scan's tablet search instead")
+            ("ttl-search-shards", bpo::value<unsigned>()->default_value(32), "Shards per node for --ttl-search.")
+            ("ttl-search-rounds", bpo::value<int>()->default_value(20), "Passes to average for --ttl-search.")
             ("verbose", "Enables standard logging")
             ;
     return app.run(argc, argv, [&] {
@@ -329,6 +427,10 @@ int scylla_tablets_main(int argc, char** argv) {
             });
             logalloc::prime_segment_pool(memory::stats().total_memory(), memory::min_free_memory()).get();
             try {
+                if (app.configuration().contains("ttl-search")) {
+                    test_ttl_tablet_search(app);
+                    return;
+                }
                 test_basic_operations(app).get();
             } catch (seastar::abort_requested_exception&) {
                 // Ignore
