@@ -905,6 +905,11 @@ public:
         }.payload_size();
     }
 
+    // Keys of the primary index, its allocator's bytes (B+tree included) and its entries alone.
+    std::tuple<size_t, size_t, size_t> index_memory() noexcept {
+        return {index().get_key_count(), index().get_memory_usage(), index().get_entries_memory_usage()};
+    }
+
 private:
     primary_index& index() noexcept {
         return _group->logstor_index();
@@ -1247,6 +1252,9 @@ int main(int argc, char** argv) {
                 const auto payload_bytes = bench.local().payload_size();
                 fmt::print("frame: {} bytes in a segment for {} bytes of row ({:.2f}x)\n",
                         frame_size, payload_bytes, payload_bytes ? double(frame_size) / payload_bytes : 0.0);
+                const auto [keys, index_bytes, entry_bytes] = bench.local().index_memory();
+                fmt::print("index: {} keys, {} bytes ({:.2f} bytes/key), entries alone {:.2f} bytes/key\n",
+                        keys, index_bytes, keys ? double(index_bytes) / keys : 0.0, keys ? double(entry_bytes) / keys : 0.0);
                 for (auto kind : run.tests) {
                     fmt::print("\n{}:\n", name_of(kind));
                     auto results = run_test(bench, kind, cfg);
