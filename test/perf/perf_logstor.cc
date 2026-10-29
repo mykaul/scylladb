@@ -117,6 +117,9 @@
 //   append           copy one record whose value is already encoded into the buffer of the writer
 //   append-chunk     like `append`, into a buffer that fills up and is reset only when the next
 //                    record does not fit, so the per-chunk costs amortize as in a write
+//   chunk-one        what a chunk of one record costs before its IO, which is what a write pays
+//                    when the flush timer seals every record alone: `append` into an empty buffer,
+//                    and the seal, which pads the chunk to a block and computes its CRCs
 //   serialize        what a write pays before its record reaches the buffer: `encode`,
 //                    `record-header` and `append`
 //   cache-lookup     look one cached partition up and copy it and its key out of the cache region,
@@ -334,6 +337,7 @@ enum class test_kind {
     record_header,
     append,
     append_chunk,
+    chunk_one,
     serialize,
     cache_lookup,
     cache_populate,
@@ -355,6 +359,7 @@ const std::vector<std::pair<std::string_view, test_kind>> test_kinds = {
     {"record-header", test_kind::record_header},
     {"append", test_kind::append},
     {"append-chunk", test_kind::append_chunk},
+    {"chunk-one", test_kind::chunk_one},
     {"serialize", test_kind::serialize},
     {"cache-lookup", test_kind::cache_lookup},
     {"cache-populate", test_kind::cache_populate},
@@ -804,6 +809,21 @@ public:
         }
     }
 
+    // A chunk that holds one record, as the flush timer seals it under trickle writes.
+    void do_chunk_one(unsigned count) {
+        for (unsigned i = 0; i < count; ++i) {
+            _sink += seal_one_record_chunk();
+        }
+    }
+
+    // The size of the chunk of one record, which is what a write of one record takes on disk.
+    size_t seal_one_record_chunk() {
+        _serialization_buffer->reset();
+        _serialization_buffer->append(*_record_writer);
+        _serialization_buffer->seal(segment_sequence{1}, std::nullopt, ondisk::block_alignment);
+        return _serialization_buffer->serialized_size();
+    }
+
     // What a read that the cache serves pays before its reader: the entry of the key is looked up
     // and the cached partition and its key are copied out of the cache region. Draws from the keys
     // the cache holds, which warm_cache_and_find_cached_keys() collected, rather than from the
@@ -1056,6 +1076,8 @@ std::vector<perf_result_with_io> run_test(sharded<logstor_bench>& bench, test_ki
     case test_kind::append_chunk:
         bench.invoke_on_all(&logstor_bench::start_append_chunk).get();
         return cpu_test(&logstor_bench::do_append_chunk);
+    case test_kind::chunk_one:
+        return cpu_test(&logstor_bench::do_chunk_one);
     case test_kind::serialize:
         return cpu_test(&logstor_bench::do_serialize);
     case test_kind::cache_lookup:
@@ -1270,6 +1292,7 @@ int main(int argc, char** argv) {
                 const auto payload_bytes = bench.local().payload_size();
                 fmt::print("frame: {} bytes in a segment for {} bytes of row ({:.2f}x)\n",
                         frame_size, payload_bytes, payload_bytes ? double(frame_size) / payload_bytes : 0.0);
+                fmt::print("chunk: {} bytes in a segment for one record alone\n", bench.local().seal_one_record_chunk());
                 const auto [keys, index_bytes, entry_bytes] = bench.local().index_memory();
                 fmt::print("index: {} keys, {} bytes ({:.2f} bytes/key), entries alone {:.2f} bytes/key\n",
                         keys, index_bytes, keys ? double(index_bytes) / keys : 0.0, keys ? double(entry_bytes) / keys : 0.0);
