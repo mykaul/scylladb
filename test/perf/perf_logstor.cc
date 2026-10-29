@@ -312,6 +312,7 @@
 #include "test/lib/tmpdir.hh"
 #include "test/perf/perf.hh"
 #include "types/types.hh"
+#include "utils/UUID_gen.hh"
 
 // The record size report measures the partition a record value carries through the serializer the
 // value is written with.
@@ -386,6 +387,9 @@ constexpr unsigned cpu_test_batch = 32;
 
 struct test_config {
     unsigned partitions;
+    // Tables written into the same segments, and schema versions of each that their records carry.
+    unsigned tables;
+    unsigned schema_versions;
     unsigned columns;
     size_t value_size;
     // How many of the value columns a read asks for, the first ones of the table. 0 asks for all.
@@ -402,6 +406,8 @@ struct test_config {
 
 std::ostream& operator<<(std::ostream& os, const test_config& cfg) {
     return os << "{partitions=" << cfg.partitions
+           << ", tables=" << cfg.tables
+           << ", schema_versions=" << cfg.schema_versions
            << ", columns=" << cfg.columns
            << ", value_size=" << cfg.value_size
            << ", select_columns=" << (cfg.select_columns ? std::to_string(cfg.select_columns) : std::string("all"))
@@ -415,13 +421,23 @@ std::ostream& operator<<(std::ostream& os, const test_config& cfg) {
 // A logstor table: a partition key and the value columns of the row it holds. The number of them is
 // what the description of the schema a record carries scales with, and what the framing of the
 // cells scales with, so it is a parameter of the run rather than one column.
-schema_ptr make_kv_schema(unsigned columns) {
-    auto sb = schema_builder(this_smp_shard_count(), "ks", "cf")
+schema_ptr make_kv_schema(unsigned columns, unsigned table = 0) {
+    auto sb = schema_builder(this_smp_shard_count(), "ks", table ? fmt::format("cf{}", table) : "cf")
             .with_column("pk", bytes_type, column_kind::partition_key);
     for (unsigned i = 0; i < columns; ++i) {
         sb.with_column(to_bytes(fmt::format("v{}", i)), bytes_type);
     }
     return sb.set_logstor().build();
+}
+
+// The versions an ALTER that touches no column leaves: the same columns under a new version each.
+// The last is the current one.
+std::vector<schema_ptr> make_versions(schema_ptr s, unsigned count) {
+    std::vector<schema_ptr> versions{s};
+    while (versions.size() < count) {
+        versions.push_back(schema_builder(s).with_version(table_schema_version(utils::UUID_gen::get_time_UUID())).build());
+    }
+    return versions;
 }
 
 // The row one record of the size report holds: the partition key, the columns of the table, and
@@ -539,11 +555,17 @@ query::partition_slice make_read_slice(const schema& s, unsigned select_columns,
 // segments of a shard are its own, and so is its index.
 class logstor_bench {
     test_config _cfg;
+    // The schema versions of each table, see --tables and --schema-versions.
+    std::vector<std::vector<schema_ptr>> _versions;
+    // The current schema of table 0, the table the read and single step tests use.
     schema_ptr _schema;
     // Outlives _logstor, which holds a reference to it.
     tests::logstor::shared_logstor_cache _cache;
     std::unique_ptr<logstor> _logstor;
-    std::unique_ptr<tests::logstor::test_logstor_group> _group;
+    // A group per table; _group is table 0's.
+    std::vector<std::unique_ptr<tests::logstor::test_logstor_group>> _groups;
+    tests::logstor::test_logstor_group* _group = nullptr;
+    // The keys of each table: every table holds every one of them.
     std::vector<dht::decorated_key> _keys;
     // The keys of the dataset whose partitions are in the cache, which is what the cache-lookup and
     // query-cached tests draw from: a dataset larger than the cache of the shard leaves only part of
@@ -571,8 +593,12 @@ class logstor_bench {
     // A writer of that record, whose value is already encoded, for the append test, which is about
     // what the copy into the buffer costs and not about what encoding the value costs.
     std::optional<log_record_writer> _record_writer;
-    // The frozen mutations the write-frozen test draws from, see freeze_write_pool().
-    std::vector<frozen_mutation> _frozen_pool;
+    // A record of every table and version, which append-chunk cycles through.
+    std::vector<log_record> _chunk_records;
+    std::vector<log_record_writer> _chunk_writers;
+    size_t _next_chunk_writer = 0;
+    // The frozen mutations the write-frozen test draws from, with their schemas, see freeze_write_pool().
+    std::vector<std::pair<frozen_mutation, schema_ptr>> _frozen_pool;
     // Takes the result of a step whose result is otherwise unused, so that the step is not optimized
     // away and cannot be hoisted out of the loop of the test that repeats it. Volatile because that
     // is what makes the store to it something the compiler has to keep; it costs the same load and
@@ -586,7 +612,10 @@ class logstor_bench {
 public:
     logstor_bench(test_config cfg, std::filesystem::path dir)
         : _cfg(cfg)
-        , _schema(make_kv_schema(cfg.columns))
+        , _versions(std::views::iota(0u, cfg.tables) | std::views::transform([&] (unsigned t) {
+            return make_versions(make_kv_schema(cfg.columns, t), cfg.schema_versions);
+        }) | std::ranges::to<std::vector>())
+        , _schema(_versions[0].back())
         , _value(bytes::initialized_later(), cfg.value_size)
         , _slice(make_read_slice(*_schema, cfg.select_columns, false))
         , _slice_bypassing_cache(make_read_slice(*_schema, cfg.select_columns, true))
@@ -615,7 +644,10 @@ public:
         co_await _logstor->start();
         // The cache is enabled, and the tests that are not about it bypass it per read instead, so
         // that one dataset serves them all.
-        _group = std::make_unique<tests::logstor::test_logstor_group>(_schema, *_logstor, true /* cache_enabled */);
+        for (const auto& versions : _versions) {
+            _groups.push_back(std::make_unique<tests::logstor::test_logstor_group>(versions.back(), *_logstor, true /* cache_enabled */));
+        }
+        _group = _groups[0].get();
         co_await populate();
         prepare_single_step_inputs();
         co_await open_data_file();
@@ -626,16 +658,19 @@ public:
             co_await _data_file.close();
             _data_file = seastar::file();
         }
-        if (_group) {
+        if (!_groups.empty()) {
             // The index evicts what it has in the cache before it goes, since a cached partition
             // lives in the shared cache region and the index entry only points at it. This is what
             // a table does when it stops.
-            co_await index().drain_cache();
+            for (auto& g : _groups) {
+                co_await g->logstor_index().drain_cache();
+            }
             // The group deregisters itself from the compaction manager in its destructor, which
             // waits for an ongoing compaction of the group and therefore needs a seastar thread. It
             // has to be gone before the logstor it belongs to is stopped.
             co_await seastar::async([this] {
-                _group.reset();
+                _group = nullptr;
+                _groups.clear();
             });
         }
         co_await _logstor->stop();
@@ -643,14 +678,17 @@ public:
         co_await _semaphore.stop();
     }
 
+    // A write of a random key of a random table, under a random version of its schema.
     future<> do_write() {
-        auto m = make_mutation(random_key());
-        co_await _logstor->write(m, write_target{.cg = _group.get()}, db::no_timeout);
+        const auto t = tests::random::get_int<size_t>(_groups.size() - 1);
+        const auto& versions = _versions[t];
+        auto m = make_mutation(versions[tests::random::get_int<size_t>(versions.size() - 1)], random_key());
+        co_await _logstor->write(m, write_target{.cg = _groups[t].get()}, db::no_timeout);
     }
 
     future<> do_write_frozen() {
-        const auto& fm = _frozen_pool[tests::random::get_int<size_t>(_frozen_pool.size() - 1)];
-        return _logstor->write(fm, *_schema, write_target{.cg = _group.get()}, db::no_timeout);
+        const auto& [fm, s] = _frozen_pool[tests::random::get_int<size_t>(_frozen_pool.size() - 1)];
+        return _logstor->write(fm, *s, write_target{.cg = _group}, db::no_timeout);
     }
 
     // Freezes the mutations of up to 1024 keys, spread over the dataset, for the write-frozen test.
@@ -663,7 +701,8 @@ public:
         _frozen_pool.clear();
         _frozen_pool.reserve(pool_size);
         for (size_t i = 0; i < pool_size; ++i) {
-            _frozen_pool.push_back(freeze(make_mutation(_keys[i * _keys.size() / pool_size])));
+            const auto& s = _versions[0][i % _versions[0].size()];
+            _frozen_pool.emplace_back(freeze(make_mutation(s, _keys[i * _keys.size() / pool_size])), s);
         }
     }
 
@@ -800,12 +839,15 @@ public:
 
     // What a write pays per record in a filling chunk: the buffer is reset only when the next record
     // does not fit, so the per-chunk costs (headers, schema frame) amortize over the records that fit.
+    // With several tables or versions, consecutive records cycle through all of them.
     void do_append_chunk(unsigned count) {
         for (unsigned i = 0; i < count; ++i) {
-            if (!_serialization_buffer->can_fit(*_record_writer)) {
+            auto& writer = _chunk_writers[_next_chunk_writer];
+            _next_chunk_writer = (_next_chunk_writer + 1) % _chunk_writers.size();
+            if (!_serialization_buffer->can_fit(writer)) {
                 _serialization_buffer->reset();
             }
-            _serialization_buffer->append(*_record_writer);
+            _serialization_buffer->append(writer);
         }
     }
 
@@ -958,20 +1000,28 @@ private:
         return *_cached_keys[tests::random::get_int<size_t>(_cached_keys.size() - 1)];
     }
 
-    record_header make_record_header(const dht::decorated_key& key) const {
+    record_header make_record_header(const dht::decorated_key& key, table_id table) const {
         return record_header{
             .key = key,
             .timestamp = api::new_timestamp(),
-            .table = _schema->id(),
+            .table = table,
         };
     }
 
+    record_header make_record_header(const dht::decorated_key& key) const {
+        return make_record_header(key, _schema->id());
+    }
+
     mutation make_mutation(const dht::decorated_key& key) const {
+        return make_mutation(_schema, key);
+    }
+
+    mutation make_mutation(const schema_ptr& s, const dht::decorated_key& key) const {
         const auto ts = api::new_timestamp();
-        mutation m(_schema, key);
-        auto& row = m.partition().clustered_row(*_schema, clustering_key::make_empty());
+        mutation m(s, key);
+        auto& row = m.partition().clustered_row(*s, clustering_key::make_empty());
         row.apply(row_marker(ts));
-        for (const auto& value_def : _schema->regular_columns()) {
+        for (const auto& value_def : s->regular_columns()) {
             row.cells().apply(value_def, atomic_cell::make_live(*value_def.type, ts, _value));
         }
         return m;
@@ -985,22 +1035,29 @@ private:
         _data_file_size = co_await _data_file.size();
     }
 
+    // --partitions is split over the tables; each version of a table writes an equal share of its keys.
     future<> populate() {
-        _keys.reserve(_cfg.partitions);
-        for (unsigned i = 0; i < _cfg.partitions; ++i) {
+        const unsigned keys_per_table = _cfg.partitions / _cfg.tables;
+        _keys.reserve(keys_per_table);
+        for (unsigned i = 0; i < keys_per_table; ++i) {
             auto pk = partition_key::from_single_value(*_schema, serialized(int64_t(i)));
             _keys.push_back(dht::decorate_key(*_schema, std::move(pk)));
         }
         // A write completes only once its record has been flushed to a segment, so writing the
         // dataset one record at a time would wait for the disk for the whole populate phase.
-        co_await max_concurrent_for_each(_keys, _cfg.concurrency, [this] (const dht::decorated_key& key) -> future<> {
-            auto m = make_mutation(key);
-            co_await _logstor->write(m, write_target{.cg = _group.get()}, db::no_timeout);
+        // Tables interleave, so the segments the separator reads hold records of all of them.
+        co_await max_concurrent_for_each(std::views::iota(size_t(0), _keys.size() * _groups.size()), _cfg.concurrency, [this] (size_t i) -> future<> {
+            const auto k = i / _groups.size(), t = i % _groups.size();
+            const auto& versions = _versions[t];
+            auto m = make_mutation(versions[(k + t) % versions.size()], _keys[k]);
+            co_await _logstor->write(m, write_target{.cg = _groups[t].get()}, db::no_timeout);
         });
         // Seal the records into segments of the group, which is where the steady state of a node
         // has them and where a read finds them.
         co_await _logstor->flush_to_separator();
-        co_await _group->flush_separator();
+        for (auto& g : _groups) {
+            co_await g->flush_separator();
+        }
     }
 
     void prepare_single_step_inputs() {
@@ -1011,6 +1068,20 @@ private:
             .value = encode_record_value(*_mutation),
         });
         _record_writer.emplace(*_record);
+        _chunk_records.clear();
+        for (size_t t = 0; t < _versions.size(); ++t) {
+            for (const auto& s : _versions[t]) {
+                auto m = make_mutation(s, _keys[0]);
+                _chunk_records.push_back(log_record{
+                    .header = make_record_header(m.decorated_key(), s->id()),
+                    .value = encode_record_value(m),
+                });
+            }
+        }
+        _chunk_writers.clear();
+        for (const auto& r : _chunk_records) {
+            _chunk_writers.emplace_back(r);
+        }
         _serialization_buffer->reset();
         auto appended = _serialization_buffer->append(*_record_writer);
         _serialized_record = temporary_buffer<char>(_serialization_buffer->data() + appended.frame_offset,
@@ -1039,7 +1110,8 @@ std::vector<perf_result_with_io> run_test(sharded<logstor_bench>& bench, test_ki
         bench.invoke_on_all(&logstor_bench::warm_cache_and_find_cached_keys).get();
         const auto cached = bench.map_reduce0([] (const logstor_bench& b) { return b.cached_key_count(); },
                 size_t(0), std::plus<size_t>()).get();
-        const auto total = size_t(cfg.partitions) * this_smp_shard_count();
+        // The cache tests draw from table 0, whose keys are an equal share of --partitions.
+        const auto total = size_t(cfg.partitions / cfg.tables) * this_smp_shard_count();
         fmt::print("{} of the {} keys of the dataset are in the cache\n", cached, total);
         const auto count_misses = [&bench] {
             return bench.map_reduce0([] (const logstor_bench& b) { return b.cache_misses(); },
@@ -1105,6 +1177,8 @@ void write_json_result(const std::string& file, const test_config& cfg, test_kin
         const perf_result_with_io& median, size_t frame_size, size_t payload_bytes) {
     Json::Value params;
     params["partitions"] = cfg.partitions;
+    params["tables"] = cfg.tables;
+    params["schema_versions"] = cfg.schema_versions;
     params["columns"] = cfg.columns;
     params["value_size"] = cfg.value_size;
     params["select_columns"] = cfg.select_columns;
@@ -1177,6 +1251,8 @@ run_config make_run_config(const boost::program_options::variables_map& config) 
     run_config run{
         .test = test_config{
             .partitions = config["partitions"].as<unsigned>(),
+            .tables = config["tables"].as<unsigned>(),
+            .schema_versions = config["schema-versions"].as<unsigned>(),
             .columns = config["columns"].as<unsigned>(),
             .value_size = config["value-size"].as<unsigned>(),
             .select_columns = config["select-columns"].as<unsigned>(),
@@ -1205,6 +1281,12 @@ run_config make_run_config(const boost::program_options::variables_map& config) 
     if (run.test.partitions == 0) {
         throw std::invalid_argument("--partitions must be at least one: every test reads or overwrites the dataset");
     }
+    if (run.test.tables == 0 || run.test.schema_versions == 0) {
+        throw std::invalid_argument("--tables and --schema-versions must be at least one");
+    }
+    if (run.test.partitions % run.test.tables != 0) {
+        throw std::invalid_argument("--partitions must be a multiple of --tables, so that every table gets the same keys");
+    }
     if (run.test.concurrency == 0) {
         throw std::invalid_argument("--concurrency must be at least one: it is how many operations the tests that wait for the disk keep in flight");
     }
@@ -1230,6 +1312,8 @@ int main(int argc, char** argv) {
         ("random-seed", bpo::value<unsigned>(), "random number generator seed")
         ("test", bpo::value<std::string>()->default_value("all"), "comma separated tests to run, or 'all'")
         ("partitions", bpo::value<unsigned>()->default_value(100000), "number of partitions written per shard")
+        ("tables", bpo::value<unsigned>()->default_value(1), "number of tables, written into the same segments; --partitions is split over them")
+        ("schema-versions", bpo::value<unsigned>()->default_value(1), "number of schema versions of each table, same columns; writes pick one at random, reads use the last")
         ("columns", bpo::value<unsigned>()->default_value(1), "number of value columns of the table, each holding a value of --value-size bytes")
         ("value-size", bpo::value<unsigned>()->default_value(200), "size of the value of a column in bytes")
         ("select-columns", bpo::value<unsigned>()->default_value(0), "how many of the value columns a read asks for, the first ones of the table; 0 asks for all")
