@@ -1459,3 +1459,168 @@ async def test_cache(manager: ScyllaClusterManager):
             for i in range(num_keys):
                 rows = await cql.run_async(f"SELECT pk, v FROM {ks}.test_no_cache WHERE pk = {i}")
                 assert rows[0].v == i * 10, f"unexpected value for pk={i}"
+
+async def test_alter_table_and_restart(manager: ScyllaClusterManager):
+    """
+    Test that rows written under older schema versions read under the current one, after
+    ALTER TABLE adds and drops columns, after compaction moves the rows and after a restart,
+    where the column mappings of the older versions come from the logstor segments alone.
+    """
+    cmdline = ['--logger-log-level', 'logstor=debug', '--smp=1']
+    cfg = {'experimental_features': ['logstor']}
+    servers = await manager.servers_add(1, cmdline=cmdline, config=cfg)
+    cql = manager.get_cql()
+
+    async with new_test_keyspace(manager, "WITH tablets={'initial':1}") as ks:
+        await cql.run_async(f"CREATE TABLE {ks}.test (pk int PRIMARY KEY, a int, b text) WITH storage_engine = 'logstor'")
+
+        expected = {}
+        for pk in range(0, 10):
+            await cql.run_async(f"INSERT INTO {ks}.test (pk, a, b) VALUES ({pk}, {pk}, 'b{pk}')")
+            expected[pk] = {'a': pk, 'b': f'b{pk}', 'c': None}
+        await manager.api.logstor_flush(servers[0].ip_addr)
+
+        await cql.run_async(f"ALTER TABLE {ks}.test ADD c int")
+        for pk in range(10, 20):
+            await cql.run_async(f"INSERT INTO {ks}.test (pk, a, b, c) VALUES ({pk}, {pk}, 'b{pk}', {pk})")
+            expected[pk] = {'a': pk, 'b': f'b{pk}', 'c': pk}
+        await manager.api.logstor_flush(servers[0].ip_addr)
+
+        await cql.run_async(f"ALTER TABLE {ks}.test DROP b")
+        for row in expected.values():
+            del row['b']
+        for pk in range(20, 30):
+            await cql.run_async(f"INSERT INTO {ks}.test (pk, a, c) VALUES ({pk}, {pk}, {pk})")
+            expected[pk] = {'a': pk, 'c': pk}
+        # Overwrites, so that compaction has dead rows to drop and live ones to move.
+        for pk in range(0, 30, 3):
+            await cql.run_async(f"INSERT INTO {ks}.test (pk, a, c) VALUES ({pk}, {pk + 100}, {pk + 100})")
+            expected[pk] = {'a': pk + 100, 'c': pk + 100}
+        await manager.api.logstor_flush(servers[0].ip_addr)
+
+        async def check():
+            rows = await cql.run_async(f"SELECT pk, a, c FROM {ks}.test")
+            assert {r.pk: {'a': r.a, 'c': r.c} for r in rows} == expected
+            for pk, row in expected.items():
+                rows = await cql.run_async(f"SELECT pk, a, c FROM {ks}.test WHERE pk = {pk}")
+                assert len(rows) == 1
+                assert {'a': rows[0].a, 'c': rows[0].c} == row
+
+        await check()
+
+        await manager.api.logstor_compaction(servers[0].ip_addr, major=True)
+        await check()
+
+        await manager.server_stop_gracefully(servers[0].server_id)
+        await manager.server_start(servers[0].server_id)
+        cql, _ = await manager.get_ready_cql(servers)
+        await check()
+
+        # Recovery read every schema frame, and found each record's in the record's chunk.
+        metrics = await manager.metrics.query(servers[0].ip_addr)
+        assert metrics.get("scylla_logstor_sm_schema_frames_skipped") == 0
+        assert metrics.get("scylla_logstor_sm_records_without_schema_frame") == 0
+        assert metrics.get("scylla_logstor_sm_known_schema_versions") >= 3
+
+@pytest.mark.skip_mode(mode='release', reason='error injections are not supported in release mode')
+async def test_recovery_without_schema_frames(manager: ScyllaClusterManager):
+    """
+    Test that recovery reads every row when it skips every schema frame it finds: the records are
+    read under their own schema version, and recovery's separator pass copies them out of their
+    mixed segments without a schema frame, which loses nothing.
+    """
+    cmdline = ['--logger-log-level', 'logstor=debug', '--smp=1']
+    cfg = {'experimental_features': ['logstor']}
+    servers = await manager.servers_add(1, cmdline=cmdline, config=cfg)
+    server = servers[0]
+    cql = manager.get_cql()
+
+    async with new_test_keyspace(manager, "WITH tablets={'initial':1}") as ks:
+        await cql.run_async(f"CREATE TABLE {ks}.test (pk int PRIMARY KEY, v text) WITH storage_engine = 'logstor'")
+
+        num_rows = 20
+        for pk in range(num_rows):
+            await cql.run_async(f"INSERT INTO {ks}.test (pk, v) VALUES ({pk}, 'v{pk}')")
+
+        async def check():
+            rows = await cql.run_async(f"SELECT pk, v FROM {ks}.test")
+            assert {r.pk: r.v for r in rows} == {pk: f'v{pk}' for pk in range(num_rows)}
+            for pk in range(num_rows):
+                rows = await cql.run_async(f"SELECT v FROM {ks}.test WHERE pk = {pk}")
+                assert [r.v for r in rows] == [f'v{pk}']
+
+        await check()
+
+        # Not gracefully, which would flush the separator and move the rows to a full segment.
+        await manager.server_stop(server.server_id, convict=False)
+        await manager.server_update_config(server.server_id, 'error_injections_at_startup', ['logstor_skip_schema_frames'])
+        await manager.server_start(server.server_id)
+        cql, _ = await manager.get_ready_cql(servers)
+        await check()
+
+        metrics = await manager.metrics.query(server.ip_addr)
+        assert metrics.get("scylla_logstor_sm_schema_frames_skipped") > 0
+        assert metrics.get("scylla_logstor_sm_records_without_schema_frame") > 0
+        # Writes recovery's copies, which have no schema frame, and frees the mixed segments.
+        await manager.api.logstor_flush(server.ip_addr)
+
+        await manager.server_stop_gracefully(server.server_id)
+        await manager.server_update_config(server.server_id, 'error_injections_at_startup', [])
+        await manager.server_start(server.server_id)
+        cql, _ = await manager.get_ready_cql(servers)
+        await check()
+
+        metrics = await manager.metrics.query(server.ip_addr)
+        assert metrics.get("scylla_logstor_sm_schema_frames_skipped") == 0
+        assert metrics.get("scylla_logstor_sm_records_without_schema_frame") >= num_rows
+
+@pytest.mark.parametrize("intranode", [False, True], ids=["internode", "intranode"])
+async def test_tablet_migration_of_older_schema_versions(manager: ScyllaClusterManager, intranode: bool):
+    """
+    Test that rows written under older schema versions read after their tablet migrates. A node
+    added after the ALTERs has never seen those versions written, and learns their column
+    mappings from the schema frames in the segments streamed to it.
+    """
+    cmdline = ['--logger-log-level', 'logstor=debug', '--smp=2' if intranode else '--smp=1']
+    cfg = {'experimental_features': ['logstor']}
+    s1 = await manager.server_add(cmdline=cmdline, config=cfg, property_file={"dc": "dc1", "rack": "rack1"})
+    servers = [s1]
+    cql, _ = await manager.get_ready_cql(servers)
+
+    await manager.disable_tablet_balancing()
+
+    async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 1} AND tablets={'initial': 2}") as ks:
+        await cql.run_async(f"CREATE TABLE {ks}.test (pk int PRIMARY KEY, v text, d int) WITH storage_engine = 'logstor'")
+
+        expected = {}
+        value = 'x' * (30 * 1024)
+        for i in range(10):
+            await cql.run_async(f"INSERT INTO {ks}.test (pk, v, d) VALUES ({i}, '{i}_{value}', {i})")
+            expected[i] = (f'{i}_{value}', None)
+        await cql.run_async(f"ALTER TABLE {ks}.test ADD w int")
+        for i in range(10, 20):
+            await cql.run_async(f"INSERT INTO {ks}.test (pk, v, w) VALUES ({i}, '{i}_{value}', {i})")
+            expected[i] = (f'{i}_{value}', i)
+        await cql.run_async(f"ALTER TABLE {ks}.test DROP d")
+
+        tablet_token = 0
+        if intranode:
+            host, src_shard = await get_tablet_replica(manager, s1, ks, 'test', tablet_token)
+            await manager.api.move_tablet(s1.ip_addr, ks, "test", host, src_shard, host, 1 - src_shard, tablet_token)
+        else:
+            s2 = await manager.server_add(cmdline=cmdline, config=cfg, property_file={"dc": "dc1", "rack": "rack1"})
+            servers.append(s2)
+            cql, _ = await manager.get_ready_cql(servers)
+            h1 = await manager.get_host_id(s1.server_id)
+            h2 = await manager.get_host_id(s2.server_id)
+            await manager.api.move_tablet(s1.ip_addr, ks, "test", h1, 0, h2, 0, tablet_token)
+
+        for pk, row in expected.items():
+            rows = await cql.run_async(f"SELECT v, w FROM {ks}.test WHERE pk = {pk}")
+            assert len(rows) == 1
+            assert (rows[0].v, rows[0].w) == row
+
+        for s in servers:
+            metrics = await manager.metrics.query(s.ip_addr)
+            assert metrics.get("scylla_logstor_sm_schema_frames_skipped") == 0
+            assert metrics.get("scylla_logstor_sm_records_without_schema_frame") == 0
