@@ -53,6 +53,7 @@ void time_it(Func func, int iterations = 5, int iterations_between_clock_reading
 struct executor_shard_stats {
     uint64_t invocations = 0;
     uint64_t allocations = 0;
+    uint64_t bytes_allocated = 0;
     uint64_t log_allocations = 0;
     uint64_t tasks_executed = 0;
     uint64_t reactor_polls = 0;
@@ -66,6 +67,7 @@ executor_shard_stats
 operator+(executor_shard_stats a, executor_shard_stats b) {
     a.invocations += b.invocations;
     a.allocations += b.allocations;
+    a.bytes_allocated += b.bytes_allocated;
     a.log_allocations += b.log_allocations;
     a.tasks_executed += b.tasks_executed;
     a.reactor_polls += b.reactor_polls;
@@ -80,6 +82,7 @@ executor_shard_stats
 operator-(executor_shard_stats a, executor_shard_stats b) {
     a.invocations -= b.invocations;
     a.allocations -= b.allocations;
+    a.bytes_allocated -= b.bytes_allocated;
     a.log_allocations -= b.log_allocations;
     a.tasks_executed -= b.tasks_executed;
     a.reactor_polls -= b.reactor_polls;
@@ -91,6 +94,7 @@ operator-(executor_shard_stats a, executor_shard_stats b) {
 
 uint64_t perf_tasks_processed();
 uint64_t perf_mallocs();
+uint64_t perf_bytes_allocated();
 uint64_t perf_logallocs();
 uint64_t perf_reactor_polls();
 
@@ -162,6 +166,7 @@ executor<Func>::executor_shard_stats_snapshot() {
     return executor_shard_stats{
         .invocations = _count,
         .allocations = perf_mallocs(),
+        .bytes_allocated = perf_bytes_allocated(),
         .log_allocations = perf_logallocs(),
         .tasks_executed = perf_tasks_processed(),
         .reactor_polls = perf_reactor_polls(),
@@ -174,6 +179,7 @@ executor<Func>::executor_shard_stats_snapshot() {
 struct perf_result {
     double throughput;
     double mallocs_per_op;
+    double bytes_allocated_per_op;
     double logallocs_per_op;
     double tasks_per_op;
     double polls_per_op;
@@ -290,6 +296,7 @@ std::vector<Res> time_parallel_ex(Func func, unsigned concurrency_per_core, int 
 
         result.throughput = static_cast<double>(stats.invocations) / duration;
         result.mallocs_per_op = double(stats.allocations) / stats.invocations;
+        result.bytes_allocated_per_op = double(stats.bytes_allocated) / stats.invocations;
         result.logallocs_per_op = double(stats.log_allocations) / stats.invocations;
         result.tasks_per_op = double(stats.tasks_executed) / stats.invocations;
         result.polls_per_op = double(stats.reactor_polls) / stats.invocations;
