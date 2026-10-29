@@ -115,6 +115,8 @@
 //   record-header    build the header of one record, which copies the decorated key of the
 //                    partition into it
 //   append           copy one record whose value is already encoded into the buffer of the writer
+//   append-chunk     like `append`, into a buffer that fills up and is reset only when the next
+//                    record does not fit, so the per-chunk costs amortize as in a write
 //   serialize        what a write pays before its record reaches the buffer: `encode`,
 //                    `record-header` and `append`
 //   cache-lookup     look one cached partition up and copy it and its key out of the cache region,
@@ -331,6 +333,7 @@ enum class test_kind {
     encode,
     record_header,
     append,
+    append_chunk,
     serialize,
     cache_lookup,
     cache_populate,
@@ -351,6 +354,7 @@ const std::vector<std::pair<std::string_view, test_kind>> test_kinds = {
     {"encode", test_kind::encode},
     {"record-header", test_kind::record_header},
     {"append", test_kind::append},
+    {"append-chunk", test_kind::append_chunk},
     {"serialize", test_kind::serialize},
     {"cache-lookup", test_kind::cache_lookup},
     {"cache-populate", test_kind::cache_populate},
@@ -784,6 +788,22 @@ public:
         }
     }
 
+    // Empties the buffer do_append_chunk() fills across its calls; another test may have left it sealed.
+    void start_append_chunk() {
+        _serialization_buffer->reset();
+    }
+
+    // What a write pays per record in a filling chunk: the buffer is reset only when the next record
+    // does not fit, so the per-chunk costs (headers, schema frame) amortize over the records that fit.
+    void do_append_chunk(unsigned count) {
+        for (unsigned i = 0; i < count; ++i) {
+            if (!_serialization_buffer->can_fit(*_record_writer)) {
+                _serialization_buffer->reset();
+            }
+            _serialization_buffer->append(*_record_writer);
+        }
+    }
+
     // What a read that the cache serves pays before its reader: the entry of the key is looked up
     // and the cached partition and its key are copied out of the cache region. Draws from the keys
     // the cache holds, which warm_cache_and_find_cached_keys() collected, rather than from the
@@ -1033,6 +1053,9 @@ std::vector<perf_result_with_io> run_test(sharded<logstor_bench>& bench, test_ki
         return cpu_test(&logstor_bench::do_record_header);
     case test_kind::append:
         return cpu_test(&logstor_bench::do_append);
+    case test_kind::append_chunk:
+        bench.invoke_on_all(&logstor_bench::start_append_chunk).get();
+        return cpu_test(&logstor_bench::do_append_chunk);
     case test_kind::serialize:
         return cpu_test(&logstor_bench::do_serialize);
     case test_kind::cache_lookup:
