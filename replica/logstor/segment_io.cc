@@ -13,6 +13,9 @@
 #include <seastar/core/simple-stream.hh>
 #include <seastar/util/log.hh>
 
+#include "replica/logstor/record_value.hh"
+#include "utils/error_injection.hh"
+#include "utils/small_vector.hh"
 #include "serializer_impl.hh"
 
 namespace replica::logstor {
@@ -20,9 +23,6 @@ namespace replica::logstor {
 extern seastar::logger logstor_logger;
 
 namespace {
-
-// The smallest record frame: a record_frame_header and a record_header with an empty key.
-constexpr size_t min_frame_size = ondisk::record_frame_header_size + ondisk::record_header_fixed_size;
 
 // Reads a segment through its input stream, and keeps the position in the segment of what it
 // reads next.
@@ -70,10 +70,15 @@ struct chunk_headers {
     std::optional<ondisk::segment_header> segment;
 };
 
-// Returns nullopt if the stream ends first or the headers are invalid.
-future<std::optional<chunk_headers>> read_chunk_headers(segment_reader& reader) {
+// Returns nullopt if the stream ends first or the headers are invalid. Throws if the chunk was
+// written by an older logstor format.
+future<std::optional<chunk_headers>> read_chunk_headers(segment_reader& reader, log_segment_id segment_id) {
     auto ch = co_await reader.read<ondisk::chunk_header>();
-    if (!ch || !ondisk::validate_chunk_header_fields(*ch)) {
+    if (!ch) {
+        co_return std::nullopt;
+    }
+    const bool old_format = ch->magic == ondisk::chunk_header_magic && ch->version < ondisk::min_readable_version;
+    if (!old_format && !ondisk::validate_chunk_header_fields(*ch)) {
         co_return std::nullopt;
     }
 
@@ -83,6 +88,12 @@ future<std::optional<chunk_headers>> read_chunk_headers(segment_reader& reader) 
         if (!sh) {
             co_return std::nullopt;
         }
+    }
+
+    // Only a header whose CRC matches is taken for an old chunk, not stale or garbage bytes.
+    if (old_format && ch->calculate_crc(sh) == ch->crc) {
+        throw std::runtime_error(format("logstor: {} has a chunk of version {}, written by an older logstor format; "
+                "logstor data must be wiped before this version can start", segment_id, ch->version));
     }
 
     if (!ondisk::validate_chunk_headers(*ch, sh)) {
@@ -134,79 +145,121 @@ future<std::optional<temporary_buffer<char>>> read_chunk_body(segment_reader& re
     co_return body;
 }
 
-struct parsed_record {
-    record_header header;
-    log_record_bytes_view bytes; // views into the chunk body
+// A frame of a chunk body: a record frame, or a schema frame, whose header is empty.
+struct parsed_frame {
+    ondisk::record_frame_header frame_header;
+    simple_memory_input_stream header;
+    bytes_view value;
 };
 
-// Reads the record frame at the start of records, without its padding. Returns nullopt if the
-// frame header is invalid or the record does not fit in what is left of records.
-std::optional<parsed_record> read_record(simple_memory_input_stream& records) {
-    // The sizes a record claims are checked against what is left of the chunk's records before
+// Reads the frame at the start of records, without its padding. Returns nullopt if the frame
+// header is invalid or the frame does not fit in what is left of records.
+std::optional<parsed_frame> read_frame(simple_memory_input_stream& records) {
+    // The sizes a frame claims are checked against what is left of the chunk's records before
     // they are trusted, as the CRC only says the bytes are the ones written, not that the writer
     // was right.
     const size_t bytes_left = records.size();
-    if (bytes_left < min_frame_size) {
+    if (bytes_left < ondisk::record_frame_header_size) {
         return std::nullopt;
     }
     auto frame_header = ser::deserialize(records, std::type_identity<ondisk::record_frame_header>{});
-    if (!ondisk::validate_record_frame_header(frame_header) || size_t(frame_header.key_size) + frame_header.value_size > bytes_left - min_frame_size) {
+    if (!ondisk::validate_record_frame_header(frame_header)) {
         return std::nullopt;
     }
-    const size_t header_size = ondisk::record_header_size(frame_header.key_size);
+    const size_t header_size = ondisk::record_header_size(frame_header);
+    if (header_size + frame_header.value_size > bytes_left - ondisk::record_frame_header_size) {
+        return std::nullopt;
+    }
 
     auto header_stream = records.read_substream(header_size);
     auto value_stream = records.read_substream(frame_header.value_size);
-    // Taken before read_record_header() consumes the stream.
-    const auto header_bytes = bytes_view(reinterpret_cast<const int8_t*>(header_stream.begin()), header_size);
-    return parsed_record{
-        .header = ondisk::read_record_header(header_stream, frame_header.key_size),
-        .bytes = {
-            .header = header_bytes,
-            .value = bytes_view(reinterpret_cast<const int8_t*>(value_stream.begin()), value_stream.size()),
-        },
+    return parsed_frame{
+        .frame_header = frame_header,
+        .header = header_stream,
+        .value = bytes_view(reinterpret_cast<const int8_t*>(value_stream.begin()), value_stream.size()),
     };
 }
 
-// records_position is where the records start within the segment, which is what a record's
-// location is relative to. A record that does not parse ends the scan of the chunk.
+// records_position is where the records start in the segment. The body CRC matched, so a frame that
+// does not parse is an error. A schema frame that cannot be read is skipped and the records after
+// it are still indexed.
 future<> scan_chunk_records(simple_memory_input_stream records,
         size_t records_position,
         log_segment_id segment_id,
         const record_header_consumer& on_record_header,
         const log_record_bytes_consumer& on_record) {
     const size_t records_size = records.size();
+    utils::small_vector<const known_schema*, 2> chunk_schemas;
+    size_t bad_schema_frames = 0;
+    size_t records_without_schema_frame = 0;
     while (records.size() > 0) {
         const size_t record_offset = records_position + (records_size - records.size());
-        auto record = read_record(records);
-        if (!record) {
-            break;
+        auto frame = read_frame(records);
+        if (!frame) {
+            throw std::runtime_error(format("logstor: invalid frame at offset {} of {}, in a chunk whose body CRC matches",
+                    record_offset, segment_id));
         }
 
-        logstor_logger.trace("Found record of size {} bytes in {}",
-                            record->bytes.header.size() + record->bytes.value.size(), segment_id);
+        if (frame->frame_header.kind == frame_kind::schema) {
+            try {
+                utils::get_local_injector().inject("logstor_skip_schema_frames", [] {
+                    throw std::runtime_error("schema frame skipped by injection");
+                });
+                chunk_schemas.push_back(remember_schema_frame(frame->value));
+            } catch (...) {
+                if (!bad_schema_frames++) {
+                    logstor_logger.warn("Skipped a schema frame at offset {} of {}: {}", record_offset, segment_id, std::current_exception());
+                }
+            }
+        } else {
+            const auto header_bytes = bytes_view(reinterpret_cast<const int8_t*>(frame->header.begin()), frame->header.size());
+            const auto header = ondisk::read_record_header(frame->header, frame->frame_header.key_size);
+            auto bytes = log_record_bytes_view{
+                .header = header_bytes,
+                .value = frame->value,
+            };
 
-        record_location loc {
-            .segment = segment_id,
-            .offset = static_cast<uint32_t>(record_offset),
-            .size = static_cast<uint32_t>(ondisk::record_frame_size(record->bytes.header.size(), record->bytes.value.size()))
-        };
+            logstor_logger.trace("Found record of size {} bytes in {}", bytes.header.size() + bytes.value.size(), segment_id);
 
-        if (on_record_header(loc, record->header) == want_data::yes) {
-            co_await on_record(loc, record->header, record->bytes);
+            record_location loc {
+                .segment = segment_id,
+                .offset = static_cast<uint32_t>(record_offset),
+                .size = static_cast<uint32_t>(ondisk::record_frame_size(bytes.header.size(), bytes.value.size()))
+            };
+
+            // Checked for every record, so that every scan verifies I1. A copy of the record writes
+            // the schema frame found here; the map is only a fallback for a chunk that lacks it.
+            const auto v = record_schema_version(frame->value);
+            auto it = std::ranges::find(chunk_schemas, v, &known_schema::version);
+            const known_schema* known = it != chunk_schemas.end() ? *it : find_known_schema(v);
+            if (it == chunk_schemas.end() || !known || known->table != header.table) [[unlikely]] {
+                ++records_without_schema_frame;
+                known = known && known->table == header.table ? known : nullptr;
+            }
+            bytes.schema = known;
+
+            if (on_record_header(loc, header) == want_data::yes) {
+                co_await on_record(loc, header, bytes);
+            }
         }
 
         // The next record frame starts at a multiple of record_alignment.
         const size_t consumed = records_size - records.size();
         records.skip(std::min(align_up(consumed, ondisk::record_alignment) - consumed, records.size()));
     }
+    if (bad_schema_frames || records_without_schema_frame) [[unlikely]] {
+        get_schema_frame_stats().skipped += bad_schema_frames;
+        get_schema_frame_stats().records_without_frame += records_without_schema_frame;
+        logstor_logger.warn("Chunk at offset {} of {}: {} schema frames skipped, {} records read without the schema frame of their version",
+                records_position, segment_id, bad_schema_frames, records_without_schema_frame);
+    }
 }
 
 } // anonymous namespace
 
-future<std::optional<segment_info>> read_segment_info(seastar::input_stream<char>& in) {
+future<std::optional<segment_info>> read_segment_info(seastar::input_stream<char>& in, log_segment_id segment_id) {
     segment_reader reader(in);
-    auto headers = co_await read_chunk_headers(reader);
+    auto headers = co_await read_chunk_headers(reader, segment_id);
     if (!headers) {
         co_return std::nullopt;
     }
@@ -233,7 +286,7 @@ future<> scan_segment(seastar::input_stream<char>& in,
         // A chunk with invalid headers, or a chunk of an earlier generation of the segment, ends the
         // scan. Chunks are written in sequence, so no chunk of this generation of the segment
         // follows it.
-        auto headers = co_await read_chunk_headers(reader);
+        auto headers = co_await read_chunk_headers(reader, segment_id);
         if (!headers) {
             break;
         }

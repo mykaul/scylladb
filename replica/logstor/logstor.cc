@@ -152,6 +152,19 @@ future<> logstor::write(const frozen_mutation& m, const schema& s, write_target 
     }
 }
 
+// Out of line, so that the record it builds takes no room in the coroutine frame of do_write().
+[[gnu::noinline]]
+static log_record_writer make_record_writer(table_id table, dht::decorated_key dk, api::timestamp_type ts, record_value value) {
+    return log_record_writer(log_record {
+        .header = {
+            .key = std::move(dk),
+            .timestamp = ts,
+            .table = table,
+        },
+        .value = std::move(value),
+    });
+}
+
 future<> logstor::do_write(const schema& s, dht::decorated_key dk, api::timestamp_type ts, record_value value,
         write_target target, db::timeout_clock::time_point timeout) {
     auto gate_holder = _async_gate.hold();
@@ -160,16 +173,7 @@ future<> logstor::do_write(const schema& s, dht::decorated_key dk, api::timestam
     primary_index_key key(dk);
     auto& index = cg.logstor_index();
 
-    log_record record {
-        .header = {
-            .key = std::move(dk),
-            .timestamp = ts,
-            .table = s.id(),
-        },
-        .value = std::move(value),
-    };
-
-    auto writer = log_record_writer(std::move(record));
+    auto writer = make_record_writer(s.id(), std::move(dk), ts, std::move(value));
 
     // Two waits, not one: first for the record to be taken into a buffer, then for that buffer to
     // reach a segment. They are awaited here rather than behind a call of their own, which would

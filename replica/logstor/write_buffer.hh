@@ -11,6 +11,7 @@
 #include <memory>
 #include <vector>
 #include <seastar/core/abort_source.hh>
+#include <seastar/core/align.hh>
 #include <seastar/core/future.hh>
 #include <seastar/core/gate.hh>
 #include <seastar/core/aligned_buffer.hh>
@@ -24,7 +25,9 @@
 #include <seastar/core/timer.hh>
 
 #include "replica/logstor/ondisk.hh"
+#include "replica/logstor/record_value.hh"
 #include "timeout_config.hh"
+#include "utils/small_vector.hh"
 
 namespace replica {
 
@@ -49,10 +52,12 @@ class log_record_writer {
     using ostream = seastar::simple_memory_output_stream;
 
     log_record _record;
+    const known_schema* _schema;
 
 public:
     explicit log_record_writer(log_record record)
         : _record(std::move(record))
+        , _schema(find_known_schema(record_schema_version(_record.value)))
     {}
 
     const log_record& record() const { return _record; }
@@ -62,32 +67,36 @@ public:
     size_t value_size() const { return _record.value.size(); }
     // The record without its frame header: the record header and the value.
     size_t record_size() const { return header_size() + value_size(); }
+    // The version whose schema frame the record's chunk must have.
+    table_schema_version schema_version() const { return record_schema_version(_record.value); }
+    const known_schema* schema() const noexcept { return _schema; }
 
     // Write the record's frame - frame header, record header, value - to an output stream.
     void write_frame(ostream& out) const;
 };
 
 // Writer for log records that stores pre-serialized bytes.
-// Used in compaction and separator rewriting to avoid deserialization.
+// Used in compaction and separator rewriting to avoid deserialization. The schema frame it writes
+// is the one the scan found in the record's source chunk, not looked up again.
 class log_record_bytes_writer {
     using ostream = seastar::simple_memory_output_stream;
 
     record_header _header;
-    bytes_view _header_bytes;
-    bytes_view _value_bytes;
+    log_record_bytes_view _record_view;
 
 public:
     log_record_bytes_writer(record_header header, log_record_bytes_view record_view)
         : _header(std::move(header))
-        , _header_bytes(record_view.header)
-        , _value_bytes(record_view.value)
+        , _record_view(record_view)
     {}
 
     const record_header& header() const { return _header; }
 
-    size_t header_size() const { return _header_bytes.size(); }
-    size_t value_size() const { return _value_bytes.size(); }
+    size_t header_size() const { return _record_view.header.size(); }
+    size_t value_size() const { return _record_view.value.size(); }
     size_t record_size() const { return header_size() + value_size(); }
+    table_schema_version schema_version() const { return record_schema_version(_record_view.value); }
+    const known_schema* schema() const noexcept { return _record_view.schema; }
 
     void write_frame(ostream& out) const;
 };
@@ -98,6 +107,8 @@ concept log_record_writer_concept = requires(const T& w, seastar::simple_memory_
     { w.header_size() } -> std::convertible_to<size_t>;
     { w.value_size() } -> std::convertible_to<size_t>;
     { w.record_size() } -> std::convertible_to<size_t>;
+    { w.schema_version() } -> std::same_as<table_schema_version>;
+    { w.schema() } -> std::same_as<const known_schema*>;
     { w.write_frame(out) };
 };
 
@@ -129,6 +140,9 @@ struct buffered_write_result {
 //   ...
 //   zero padding to the requested final alignment
 //
+// A record that refers to its schema version is preceded by the version's schema frame, if it is
+// the first of that version in the chunk, so that every chunk is readable on its own.
+//
 // Each record frame is padded to record_alignment. For a full segment's chunk,
 // the segment header stores the owning table and the min/max token range of the
 // appended records. This type is serialization-only and is used directly by tests
@@ -157,9 +171,15 @@ private:
     ostream _header_stream;
     ostream _segment_header_stream;
 
-    // The frame sizes of the appended records summed, their padding excluded.
+    // The frame sizes of the appended records summed, their padding and schema frames excluded.
     size_t _record_bytes{0};
     size_t _record_count{0};
+    // The bytes of the schema frames appended to the chunk, padding included.
+    size_t _schema_frame_bytes{0};
+    // Unique per chunk, and larger for a later chunk; see known_schema::chunk_stamp.
+    uint64_t _chunk_stamp{0};
+    // The entries of the schema frames the chunk holds.
+    utils::small_vector<const known_schema*, 1> _schema_frames;
     std::optional<dht::token> _min_token;
     std::optional<dht::token> _max_token;
 
@@ -184,18 +204,26 @@ public:
 
     size_t buffer_size() const noexcept { return _buffer_size; }
 
-    bool can_fit(size_t record_size) const noexcept;
-
     template <log_record_writer_concept Writer>
     bool can_fit(const Writer& writer) const noexcept {
-        return can_fit(writer.record_size());
+        const size_t frame_space = padded_frame_size(writer.record_size());
+        if (!writer.schema() || has_schema_frame(*writer.schema())) {
+            return frame_space <= _stream.size();
+        }
+        return frame_space + schema_frame_space(writer.schema()) <= _stream.size();
+    }
+
+    // The room a schema frame takes ahead of a record in a chunk without it, padding included.
+    // Zero for nullptr.
+    static size_t schema_frame_space(const known_schema* k) noexcept {
+        return k ? k->schema_frame.size() : 0;
     }
 
     bool has_data() const noexcept;
 
     // The largest record - record header and value, the frame header aside - that fits an
-    // empty buffer of this size and kind. The kinds differ in what they carry ahead of their
-    // records, so a record can fit a buffer of one kind and not of the other.
+    // empty buffer of this size and kind, if it needs no schema frame. The kinds differ in what they
+    // carry ahead of their records, so a record can fit one kind and not the other.
     static constexpr size_t max_record_size(size_t buffer_size, segment_kind kind) noexcept {
         const size_t overhead = chunk_headers_size(kind) + ondisk::record_frame_header_size;
         return buffer_size > overhead ? buffer_size - overhead : 0;
@@ -216,6 +244,7 @@ public:
 
     size_t record_bytes() const noexcept { return _record_bytes; }
     size_t record_count() const noexcept { return _record_count; }
+    size_t schema_frame_bytes() const noexcept { return _schema_frame_bytes; }
     segment_kind kind() const noexcept { return _segment_kind; }
 
     template <log_record_writer_concept Writer>
@@ -224,8 +253,10 @@ public:
     // The size of the chunk that sealing the buffer at `alignment` would produce.
     size_t chunk_size(size_t alignment) const noexcept;
 
-    // How many segments of this kind `record_count` records of `record_bytes` bytes take.
-    static size_t estimate_required_segments(size_t record_bytes, size_t record_count, size_t segment_size, segment_kind);
+    // How many segments of this kind `record_count` records of `record_bytes` bytes take, when each
+    // segment also holds `schema_frame_bytes` of schema frames, which the record bytes do not count.
+    static size_t estimate_required_segments(size_t record_bytes, size_t record_count, size_t segment_size, segment_kind,
+            size_t schema_frame_bytes = 0);
 
     bool with_segment_header() const noexcept {
         return _segment_kind == segment_kind::full;
@@ -253,6 +284,20 @@ public:
     bytes_view chunk() const;
 
 private:
+
+    // A frame and the padding that follows it.
+    static size_t padded_frame_size(size_t record_size) noexcept {
+        return align_up(ondisk::record_frame_header_size + record_size, ondisk::record_alignment);
+    }
+
+    // Whether the chunk holds the schema frame of k. A stamp below ours was never this chunk's;
+    // only one a later chunk overwrote needs the scan.
+    bool has_schema_frame(const known_schema& k) const noexcept {
+        if (k.chunk_stamp <= _chunk_stamp) [[likely]] {
+            return k.chunk_stamp == _chunk_stamp;
+        }
+        return std::ranges::contains(_schema_frames, &k);
+    }
 
     // table is set for segment_kind::full
     void write_header(segment_sequence segment_seq, std::optional<table_id> table);
@@ -312,7 +357,6 @@ public:
 
     size_t buffer_size() const noexcept { return _raw.buffer_size(); }
 
-    bool can_fit(size_t record_size) const noexcept { return _raw.can_fit(record_size); }
     template <log_record_writer_concept Writer>
     bool can_fit(const Writer& writer) const noexcept { return _raw.can_fit(writer); }
     bool has_data() const noexcept { return _raw.has_data(); }
@@ -320,6 +364,7 @@ public:
     size_t max_record_size() const noexcept { return _raw.max_record_size(); }
     size_t record_bytes() const noexcept { return _raw.record_bytes(); }
     size_t record_count() const noexcept { return _raw.record_count(); }
+    size_t schema_frame_bytes() const noexcept { return _raw.schema_frame_bytes(); }
 
     size_t chunk_size(size_t alignment) const noexcept {
         return _raw.chunk_size(alignment);

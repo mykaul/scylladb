@@ -1030,6 +1030,16 @@ segment_manager_impl::segment_manager_impl(segment_manager_config config)
     namespace sm = seastar::metrics;
 
     _metrics.add_group("logstor_sm", {
+        sm::make_counter("schema_frames_written", [] { return get_schema_frame_stats().written; },
+                sm::description("Schema frames appended to chunks: one per schema version per chunk")),
+        sm::make_counter("schema_frame_bytes_written", [] { return get_schema_frame_stats().bytes_written; },
+                sm::description("Bytes of schema frames appended to chunks, padding included")),
+        sm::make_counter("schema_frames_skipped", [] { return get_schema_frame_stats().skipped; },
+                sm::description("Schema frames a scan skipped because they did not parse or conflicted with a known schema version")),
+        sm::make_counter("records_without_schema_frame", [] { return get_schema_frame_stats().records_without_frame; },
+                sm::description("Records a scan found without the schema frame of their version in their chunk")),
+        sm::make_gauge("known_schema_versions", [] { return known_column_mapping_count(); },
+                sm::description("Schema versions whose column mapping the shard holds")),
         sm::make_gauge("segments_in_use", [this] { return segments_in_use(); },
                        sm::description("Counts number of segments currently in use.")),
         sm::make_gauge("free_segments", [this] { return available_segment_count(); },
@@ -1301,6 +1311,10 @@ future<> segment_manager_impl::write_full_segment(write_buffer& wb, logstor_grou
         co_await coroutine::return_exception_ptr(std::move(ex));
     }
     auto pos = append_result.get();
+    // Compaction outputs predict compaction outputs; a separator segment holds recent writes.
+    if (source == write_source::compaction) {
+        cg.record_schema_frame_bytes(wb.schema_frame_bytes());
+    }
 
     _stats.bytes_written[static_cast<size_t>(source)] += chunk.size();
     _stats.data_bytes_written[static_cast<size_t>(source)] += wb.record_bytes();
@@ -1560,7 +1574,7 @@ future<std::optional<segment_info>> segment_manager_impl::read_segment_info(log_
         .buffer_size = block_alignment,
         .read_ahead = 0,
     });
-    auto result = co_await coroutine::as_future(::replica::logstor::read_segment_info(in));
+    auto result = co_await coroutine::as_future(::replica::logstor::read_segment_info(in, segment_id));
     co_await in.close();
     if (result.failed()) {
         co_return coroutine::exception(result.get_exception());
@@ -1699,7 +1713,7 @@ compaction_reenabler compaction_manager_impl::disable_compaction_no_wait(logstor
 std::optional<compaction_manager_impl::compaction_candidate>
 compaction_manager_impl::select_segments_for_compaction(logstor_group& cg, const compaction_batch_limits& limits) {
     const auto segment_size = _sm.get_segment_size();
-    auto batch = select_compaction_batch(cg.logstor_segments(), segment_size, limits);
+    auto batch = select_compaction_batch(cg.logstor_segments(), segment_size, limits, cg.schema_frame_bytes());
     if (!batch) {
         return std::nullopt;
     }

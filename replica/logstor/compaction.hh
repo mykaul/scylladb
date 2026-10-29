@@ -390,10 +390,6 @@ struct separator_buffer {
         return buf && buf->can_fit(writer);
     }
 
-    bool can_fit(size_t write_size) const noexcept {
-        return buf && buf->can_fit(write_size);
-    }
-
     bool empty() const noexcept {
         return !buf || !buf->has_data();
     }
@@ -467,6 +463,8 @@ class logstor_group {
     // Whether the separator may write to this group. The group must be registered with the compaction
     // manager in order for it to be enabled.
     bool _separator_enabled{false};
+    // Moving average of the schema frame bytes of the full segments compaction wrote for the group.
+    std::optional<uint64_t> _schema_frame_bytes;
 
     void switch_active_separator_buffer();
 
@@ -494,6 +492,17 @@ public:
     }
     const segment_set& logstor_segments() const noexcept {
         return _logstor_segments;
+    }
+
+    // 0 until compaction wrote a segment for the group.
+    uint64_t schema_frame_bytes() const noexcept {
+        return _schema_frame_bytes.value_or(0);
+    }
+
+    // Takes the schema frame bytes of a full segment: the first sample is the average, then an EMA of weight 1/8.
+    void record_schema_frame_bytes(uint64_t sample) noexcept {
+        const auto avg = int64_t(_schema_frame_bytes.value_or(sample));
+        _schema_frame_bytes = avg + (int64_t(sample) - avg) / 8;
     }
 
     void add_logstor_segment(segment_descriptor& desc) {

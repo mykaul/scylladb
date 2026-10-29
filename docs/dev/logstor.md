@@ -204,7 +204,7 @@ A serialized form of `ondisk::chunk_header`.
 |--------|------|-------------|-------------|
 | 0      | 4    | `magic`     | `0x4C475342`. Used to detect valid chunks during recovery. |
 | 4      | 1    | `kind`      | Segment kind: `0` = mixed, `1` = full. |
-| 5      | 1    | `version`   | Version of the chunk format. |
+| 5      | 1    | `version`   | Version of the chunk format, 2. A chunk of an older version is refused: logstor is experimental and has no upgrade path. |
 | 6      | 2    | `reserved`  | Reserved for future use. Currently written as zero and included in the CRC. |
 | 8      | 8    | `segment_seq` | Monotonic segment sequence number used during recovery and segment ordering checks. |
 | 16     | 4    | `records_size` | Size in bytes of the record frames following the header(s), their padding included. |
@@ -237,6 +237,37 @@ record_value         (value_size bytes)
 zero_padding         -- to align to record_alignment (8 bytes)
 ```
 
+A chunk also holds one schema frame per schema version its records were written under, ahead of
+the first record of that version. A schema frame is a frame of `frame_kind::schema` with no record
+header and a `key_size` of zero; its value is the schema version, the id of the table the version
+belongs to, and the IDL-serialized `column_mapping` of that version. `raw_write_buffer::append()` inserts it, on every path that
+builds a chunk. Only the chunk scan reads it, into a per-shard map of version to column mapping;
+a record read never looks for it, and it is never indexed. The map is not pruned while the shard
+runs. A restart rebuilds it from the schema frames on disk, so it holds the versions with frames
+in the segments recovery scans (the live ones, and freed ones not yet reused) plus the versions
+written since the start. What the shard adds while running is bounded by roughly the number of
+`ALTER TABLE`s since the start times the size of an entry.
+
+```
+record_frame_header  (8 bytes; key_size 0, kind schema)
+schema_version       (16 bytes)
+table                (16 bytes)
+column_mapping       (value_size - 32 bytes)
+zero_padding         -- to align to record_alignment (8 bytes)
+```
+
+The invariants the write and copy paths keep, and the scan checks:
+
+- **I1**: a record's chunk holds the schema frame of the record's version, before the record.
+- **I2**: no path that builds a chunk depends on bytes outside the chunk it copies from: compaction
+  and the separator write the schema frame the scan found in the record's source chunk.
+- **I3**: a schema version stands for one table and one column mapping, cluster-wide and forever.
+  Every schema change gets a fresh time-UUID version, which is copied, never recomputed.
+- **I4**: every chunk is built by `raw_write_buffer::append()`, which inserts the schema frames.
+- **I5**: the per-shard map holds a version before anything reads a record of it: the write that
+  first uses a version fills it, and recovery and the load of a streamed segment scan the schema
+  frames before the records are indexed.
+
 The sizes of the parts of a frame are named consistently throughout the code, since several of
 them are otherwise easy to confuse:
 
@@ -253,8 +284,10 @@ them are otherwise easy to confuse:
 
 | Offset | Size | Field       | Description |
 |--------|------|-------------|-------------|
-| 0      | 4    | `key_size`  | Size in bytes of the partition key at the end of the `record_header` that follows. |
-| 4      | 4    | `value_size` | Size in bytes of the `record_value` that follows the `record_header`. |
+| 0      | 2    | `key_size`  | Size in bytes of the partition key at the end of the `record_header` that follows. Zero in a schema frame. |
+| 2      | 1    | `kind`      | `frame_kind`: 0 a record (`mutation`), 1 a schema frame (`schema`). |
+| 3      | 1    | `reserved`  | Zero. |
+| 4      | 4    | `value_size` | Size in bytes of the `record_value` that follows the `record_header`, or of the schema frame's value. |
 
 **Record Header** (`record_header`):
 
@@ -276,10 +309,48 @@ The encoding is written and read in `replica/logstor/record_value.cc`, behind `e
 | Offset | Size       | Field                | Description |
 |--------|------------|----------------------|-------------|
 | 0      | 16         | `schema_version`     | The version of the schema the record was written under, as its most significant and then its least significant 64-bit half. |
-| 16     | variable   | `column_mapping`     | The columns of that schema version, IDL-serialized. A read under the same schema version steps over it; a read under another version uses it to map the record's columns onto the schema's, so a record stays readable after an `ALTER TABLE`. It is stored in the record because the schema history in the system tables keeps superseded versions only for a while. |
-|        | variable   | `mutation_partition` | The partition, IDL-serialized as `mutation_partition_serializer` writes it. |
+| 16     | variable   | `mutation_partition` | The partition, IDL-serialized as `mutation_partition_serializer` writes it. |
+
+A read under the same schema version decodes the partition directly. A read under another version
+maps the record's columns onto the schema's through the column mapping of the record's version,
+which the per-shard map holds from the chunk's schema frame, so a record stays readable after an
+`ALTER TABLE`.
 
 The value has no frame or size of its own: `value_size` gives its size.
+
+A frame header is valid when its `reserved` byte is zero and its `kind` is known, a record's
+`value_size` holds at least the schema version, and a schema frame has a `key_size` of zero and a
+value longer than the version and the table id.
+
+#### Errors
+
+A chunk whose body CRC fails is skipped as a whole, and loses its records, as before schema
+frames. Within a chunk whose body CRC matches:
+
+- A frame that does not parse - an unknown `kind`, a `reserved` byte that is not zero, a size
+  too short for its kind or past the chunk - stops the scan with an error. It is data this code
+  did not write, such as a newer format, and is never taken for the end of the chunk.
+- A schema frame whose value does not parse, or whose version is known with another table or
+  column mapping, is skipped with a warning. The records after it are still indexed: a record
+  of that version reads under its own version, and a read under another version, or a copy,
+  takes the mapping from the per-shard map if another chunk or a write put it there, and fails
+  for that record alone if not.
+- A record whose chunk lacks the schema frame of its version, or has one naming another table,
+  is treated the same way, and counted in the warning the scan logs for the chunk.
+- A write that finds an entry a scan added with another table or column mapping replaces it with
+  the live schema's, and logs a warning; a chunk open at that moment keeps the frame it already holds.
+
+On each path, then:
+
+- A user write that cannot be encoded fails with an exception to the client.
+- A copy of a record without a schema entry - compaction, the separator, recovery's separator
+  pass - carries the record as it is, without a schema frame, so nothing is lost. A read of it
+  under another version fails for that record alone.
+- Compaction or the separator that fails to copy a record fails the task, and the source segment
+  is kept.
+- Recovery and the load of a streamed segment fail only on a frame that does not parse, or a
+  chunk of version 1 (logstor data must then be wiped).
+- A read fails only the record it cannot decode.
 
 **Record Location** (`record_location`):
 

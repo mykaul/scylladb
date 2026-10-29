@@ -27,7 +27,9 @@ namespace ondisk {
 
 static constexpr size_t block_alignment = 4096;
 static constexpr size_t record_alignment = 8;
-static constexpr uint8_t current_version = 1;
+static constexpr uint8_t current_version = 2;
+// Older chunks are refused: logstor is experimental and has no upgrade path.
+static constexpr uint8_t min_readable_version = current_version;
 static constexpr uint32_t chunk_header_magic = 0x4c475342;
 
 // The on-disk header types below all have a fixed serialized size. Their encoding lives in the
@@ -90,15 +92,22 @@ struct segment_header {
 // and the record value, followed by padding to record_alignment. The frame header is what a
 // record_location points at, and it is the only fixed-size part of a frame.
 struct record_frame_header {
-    uint32_t key_size;   // size of the partition key inside the record_header that follows
+    uint16_t key_size;   // size of the partition key inside the record_header that follows; 0 in a schema frame
+    frame_kind kind;     // a schema frame precedes the first record of its version in a chunk
+    uint8_t reserved;
     uint32_t value_size; // size of the record value that follows the record_header
 
     bool operator==(const record_frame_header& other) const noexcept = default;
 };
 
 // The largest partition key a record can carry. CQL caps the serialized key at this size (see
-// validation::max_key_size), so a larger key_size can only come from corruption.
+// validation::max_key_size).
 static constexpr size_t max_key_size = std::numeric_limits<uint16_t>::max();
+
+// A record value starts with its schema version; a schema frame value with the version and the
+// table id, then the column mapping.
+static constexpr size_t schema_version_size = 16;
+static constexpr size_t min_schema_frame_value_size = schema_version_size + 2 * sizeof(int64_t);
 
 // Whether the header has the magic, a kind and the version this code writes. The kind tells the
 // reader whether a segment header follows. The CRC is not checked here: validate_chunk_headers()
@@ -117,17 +126,25 @@ inline bool validate_chunk_body(const chunk_header& ch, std::span<const char> bo
     return calculate_body_crc(body) == ch.body_crc;
 }
 
+// A value too short for its kind's fixed fields cannot come from this code; neither can an
+// all-zero header, as a zero-filled tail holds.
 inline bool validate_record_frame_header(const record_frame_header& frame_header) noexcept {
-    // A record always carries an encoded value, so a zero value_size cannot come from a record
-    // this code wrote. It is what a scan sees in the zero-filled tail of a torn
-    // buffer, and rejecting it stops the scan there instead of walking the tail as a run of
-    // zero-length records. The key bound rejects a corrupt header before its key_size is
-    // trusted to size a read or an allocation.
-    return frame_header.value_size != 0 && frame_header.key_size <= max_key_size;
+    if (frame_header.reserved != 0) {
+        return false;
+    }
+    switch (frame_header.kind) {
+    case frame_kind::mutation:
+        return frame_header.value_size >= schema_version_size;
+    case frame_kind::schema:
+        return frame_header.key_size == 0 && frame_header.value_size > min_schema_frame_value_size;
+    default:
+        return false;
+    }
 }
 
 // Out of line so that the formatting and the throw stay out of the inlined read path.
 [[noreturn]] void throw_invalid_record_frame(const record_frame_header& frame_header, size_t frame_size);
+[[noreturn]] void throw_key_too_large(size_t key_size);
 
 } // namespace ondisk
 } // namespace replica::logstor
@@ -222,27 +239,33 @@ struct serializer<replica::logstor::ondisk::segment_header> {
 template <>
 struct serializer<replica::logstor::ondisk::record_frame_header> {
     static constexpr size_t serialized_size =
-        sizeof(uint32_t)            // key_size
+        sizeof(uint16_t)            // key_size
+        + sizeof(uint8_t)           // kind
+        + sizeof(uint8_t)           // reserved
         + sizeof(uint32_t);         // value_size
 
     template <typename Output>
     static void write(Output& out, const replica::logstor::ondisk::record_frame_header& h) {
-        serializer<uint32_t>::write(out, h.key_size);
-        serializer<uint32_t>::write(out, h.value_size);
+        // The fields in order, little-endian, in one write: it is on the per-record write path.
+        serializer<uint64_t>::write(out, uint64_t(h.key_size) | uint64_t(static_cast<uint8_t>(h.kind)) << 16
+                | uint64_t(h.reserved) << 24 | uint64_t(h.value_size) << 32);
     }
 
     template <typename Input>
     static replica::logstor::ondisk::record_frame_header read(Input& in) {
-        replica::logstor::ondisk::record_frame_header h;
-        h.key_size = serializer<uint32_t>::read(in);
-        h.value_size = serializer<uint32_t>::read(in);
-        return h;
+        // One read, as write() does: it is on the per-record read path.
+        const auto v = serializer<uint64_t>::read(in);
+        return replica::logstor::ondisk::record_frame_header{
+            .key_size = uint16_t(v),
+            .kind = static_cast<replica::logstor::frame_kind>(uint8_t(v >> 16)),
+            .reserved = uint8_t(v >> 24),
+            .value_size = uint32_t(v >> 32),
+        };
     }
 
     template <typename Input>
     static void skip(Input& in) {
-        serializer<uint32_t>::skip(in);
-        serializer<uint32_t>::skip(in);
+        serializer<uint64_t>::skip(in);
     }
 };
 
@@ -280,6 +303,11 @@ constexpr size_t record_header_size(size_t key_size) noexcept {
 
 inline size_t record_header_size(const record_header& h) noexcept {
     return record_header_size(h.key.key().representation().size());
+}
+
+// The size of the record header that follows a frame header: none for a schema frame.
+inline size_t record_header_size(const record_frame_header& fh) noexcept {
+    return fh.kind == frame_kind::schema ? 0 : record_header_size(fh.key_size);
 }
 
 template <typename Output>
@@ -332,11 +360,14 @@ inline size_t record_frame_size(const log_record& r) noexcept {
     return record_frame_size(record_header_size(r.header), r.value.size());
 }
 
+// raw_write_buffer::append() bounds the key by max_key_size before writing.
 template <typename Output>
 void write_record_frame(Output& out, const record_header& header, const record_value& value) {
-    const size_t header_size = record_header_size(header);
+    const size_t key_size = record_header_size(header) - record_header_fixed_size;
     ser::serializer<record_frame_header>::write(out, record_frame_header {
-        .key_size = static_cast<uint32_t>(header_size - record_header_fixed_size),
+        .key_size = static_cast<uint16_t>(key_size),
+        .kind = frame_kind::mutation,
+        .reserved = 0,
         .value_size = static_cast<uint32_t>(value.size()),
     });
     write_record_header(out, header);
@@ -346,22 +377,43 @@ void write_record_frame(Output& out, const record_header& header, const record_v
 }
 
 // The same frame for a record whose header and value are already serialized.
+// The header bytes come from a frame that was read, so the key fits.
 template <typename Output>
 void write_record_frame(Output& out, log_record_bytes_view record_view) {
     ser::serializer<record_frame_header>::write(out, record_frame_header {
-        .key_size = static_cast<uint32_t>(record_view.header.size() - record_header_fixed_size),
+        .key_size = static_cast<uint16_t>(record_view.header.size() - record_header_fixed_size),
+        .kind = frame_kind::mutation,
+        .reserved = 0,
         .value_size = static_cast<uint32_t>(record_view.value.size()),
     });
     out.write(reinterpret_cast<const char*>(record_view.header.data()), record_view.header.size());
     out.write(reinterpret_cast<const char*>(record_view.value.data()), record_view.value.size());
 }
 
+// A schema frame is a frame of record_frame_header_size and its value.
+constexpr size_t schema_frame_size(size_t value_size) noexcept {
+    return record_frame_header_size + value_size;
+}
+
+template <typename Output>
+void write_schema_frame(Output& out, bytes_view value) {
+    ser::serializer<record_frame_header>::write(out, record_frame_header {
+        .key_size = 0,
+        .kind = frame_kind::schema,
+        .reserved = 0,
+        .value_size = static_cast<uint32_t>(value.size()),
+    });
+    out.write(reinterpret_cast<const char*>(value.data()), value.size());
+}
+
+// Reads the record frame a record_location points at, which is never a schema frame.
 template <typename Input>
 log_record read_record_frame(Input& in) {
     auto frame_header = ser::serializer<record_frame_header>::read(in);
     const size_t header_size = record_header_size(frame_header.key_size);
 
-    if (!validate_record_frame_header(frame_header) || header_size + frame_header.value_size != in.size()) [[unlikely]] {
+    if (!validate_record_frame_header(frame_header) || frame_header.kind == frame_kind::schema
+            || header_size + frame_header.value_size != in.size()) [[unlikely]] {
         throw_invalid_record_frame(frame_header, record_frame_header_size + in.size());
     }
 

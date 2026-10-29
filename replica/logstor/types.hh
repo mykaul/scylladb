@@ -67,6 +67,14 @@ struct record_header {
     }
 };
 
+// What a record frame holds, and so how its value is encoded. Stored in the record_frame_header.
+enum class frame_kind : uint8_t {
+    // A record whose value names its schema version; the schema frame of its chunk has the mapping.
+    mutation = 0,
+    // A schema frame: a schema version and its column mapping. Has no record header.
+    schema = 1,
+};
+
 // The value of a record: the partition it holds, encoded. The bytes are opaque everywhere but in
 // replica/logstor/record_value.hh, where the two functions that encode and decode them live.
 class record_value {
@@ -93,9 +101,14 @@ struct log_record {
     record_value value;
 };
 
+struct known_schema;
+
 struct log_record_bytes_view {
     bytes_view header;
     bytes_view value;
+    // The entry of the record's schema version, from its chunk's schema frame; nullptr if the scan
+    // found neither that frame nor the version in the shard's map.
+    const known_schema* schema = nullptr;
 };
 
 class space_accounting_subscriber {

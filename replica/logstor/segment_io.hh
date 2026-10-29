@@ -55,7 +55,7 @@ concept log_record_consumer_like =
 
 // The segment info of the segment's first chunk, or nothing if its headers are not valid. The
 // chunk's body is not read, so a torn chunk is told apart only by scan_segment().
-future<std::optional<segment_info>> read_segment_info(seastar::input_stream<char>& in);
+future<std::optional<segment_info>> read_segment_info(seastar::input_stream<char>& in, log_segment_id segment_id);
 
 // Scans the chunks of a segment in order, and delivers their records.
 //
@@ -68,7 +68,8 @@ future<std::optional<segment_info>> read_segment_info(seastar::input_stream<char
 // or whose segment_seq is not the one of the first chunk. The body is checked against its body CRC
 // before the scan delivers a record of the chunk. A chunk whose body fails gives its segment info
 // and no records, and the scan continues at the next chunk. The scan also stops after the only
-// chunk of a full segment. A record frame that does not parse ends the scan of its chunk only.
+// chunk of a full segment. A frame that does not parse, in a chunk whose body CRC matches, fails the
+// scan; a schema frame that cannot be read is skipped, and the records after it are still indexed.
 future<> scan_segment(seastar::input_stream<char>& in,
         log_segment_id segment_id,
         size_t segment_size,

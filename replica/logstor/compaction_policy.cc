@@ -109,7 +109,7 @@ static size_t select_compaction_prefix(std::span<const compaction_candidate_scor
 }
 
 std::optional<compaction_batch> select_compaction_batch(const segment_set& segments, uint64_t segment_size,
-        const compaction_batch_limits& limits) {
+        const compaction_batch_limits& limits, size_t schema_frame_bytes) {
     const auto batch_cap = limits.batch_cap;
     std::vector<const segment_descriptor*> candidates;
     // prefix_scores[i] scores the batch made of candidates[0..i].
@@ -130,7 +130,7 @@ std::optional<compaction_batch> select_compaction_batch(const segment_set& segme
 
         const auto score = compaction_candidate_score{
             .n_in = candidates.size(),
-            .n_out = raw_write_buffer::estimate_required_segments(accum_record_bytes, accum_record_count, segment_size, segment_kind::full),
+            .n_out = raw_write_buffer::estimate_required_segments(accum_record_bytes, accum_record_count, segment_size, segment_kind::full, schema_frame_bytes),
             .live_bytes = accum_record_bytes,
         };
         prefix_scores.push_back(score);

@@ -47,7 +47,7 @@ bool validate_chunk_header_fields(const chunk_header& ch) {
         return false;
     }
 
-    return ch.version == current_version;
+    return ch.version >= min_readable_version && ch.version <= current_version;
 }
 
 bool validate_chunk_headers(const chunk_header& ch, const std::optional<segment_header>& sh) {
@@ -64,8 +64,12 @@ uint32_t calculate_body_crc(std::span<const char> body) {
 }
 
 void throw_invalid_record_frame(const record_frame_header& frame_header, size_t frame_size) {
-    throw std::runtime_error(fmt::format("Invalid record frame: key_size {} and value_size {} in a frame of {} bytes",
-            frame_header.key_size, frame_header.value_size, frame_size));
+    throw std::runtime_error(fmt::format("Invalid record frame: kind {}, reserved {}, key_size {} and value_size {} in a frame of {} bytes",
+            static_cast<unsigned>(frame_header.kind), frame_header.reserved, frame_header.key_size, frame_header.value_size, frame_size));
+}
+
+void throw_key_too_large(size_t key_size) {
+    throw std::runtime_error(fmt::format("Partition key of {} bytes exceeds the logstor limit of {}", key_size, max_key_size));
 }
 
 } // namespace replica::logstor::ondisk

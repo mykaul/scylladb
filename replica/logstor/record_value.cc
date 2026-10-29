@@ -9,7 +9,10 @@
 #include "replica/logstor/record_value.hh"
 
 #include <optional>
+#include <unordered_map>
+#include <vector>
 
+#include <absl/hash/hash.h>
 #include <boost/variant/apply_visitor.hpp>
 #include <boost/variant/static_visitor.hpp>
 
@@ -19,6 +22,7 @@
 #include "mutation/mutation_partition_serializer.hh"
 #include "mutation/mutation_partition_view.hh"
 #include "partition_builder.hh"
+#include "replica/logstor/ondisk.hh"
 #include "replica/logstor/single_row_partition.hh"
 #include "schema/schema.hh"
 #include "serializer_impl.hh"
@@ -26,6 +30,8 @@
 #include "idl/mutation.dist.impl.hh"
 
 namespace replica::logstor {
+
+extern seastar::logger logstor_logger;
 
 namespace {
 
@@ -41,37 +47,33 @@ void write_partition(Output& out, const schema&, const ser::mutation_partition_v
     ser::serialize(out, p);
 }
 
-// The record value is the partition the record holds, encoded as a canonical_mutation stripped
-// of what the record_header already carries: the table id and the partition key. What is
-// left is the version of the schema the record was written under, the column mapping of that
-// schema, and the IDL-serialized mutation_partition, each written by the serializer that
-// canonical_mutation uses for it.
-//
-//   i64  schema_version, most significant half
-//   i64  schema_version, least significant half
-//        column_mapping       ser::serializer<column_mapping>, from idl/mutation.idl.hh
-//        mutation_partition   ser::serializer<mutation_partition>, as mutation_partition_serializer
-//                             writes it
+template <typename Output>
+void write_schema_version(Output& out, table_schema_version v) {
+    ser::serializer<int64_t>::write(out, v.uuid().get_most_significant_bits());
+    ser::serializer<int64_t>::write(out, v.uuid().get_least_significant_bits());
+}
+
+template <typename Input>
+table_schema_version read_schema_version(Input& in) {
+    const auto msb = ser::serializer<int64_t>::read(in);
+    const auto lsb = ser::serializer<int64_t>::read(in);
+    return table_schema_version(utils::UUID(msb, lsb));
+}
+
+// The layout of a record value and of a schema frame's value is in docs/dev/logstor.md,
+// "On-Disk Format", "Record Frames".
 template <typename Output, typename Partition>
 void write_record_value(Output& out, const schema& s, const Partition& p) {
-    ser::serializer<int64_t>::write(out, s.version().uuid().get_most_significant_bits());
-    ser::serializer<int64_t>::write(out, s.version().uuid().get_least_significant_bits());
-    ser::serialize(out, s.get_column_mapping());
+    write_schema_version(out, s.version());
     write_partition(out, s, p);
 }
 
 // Reads a record value field by field, in the order above. Construction reads the schema
-// version; the caller then either reads or skips the mapping, and reads the partition.
+// version; the caller then reads the partition.
 template <typename Input>
 class record_value_reader {
     Input& _in;
     table_schema_version _schema_version;
-
-    static table_schema_version read_schema_version(Input& in) {
-        const auto msb = ser::serializer<int64_t>::read(in);
-        const auto lsb = ser::serializer<int64_t>::read(in);
-        return table_schema_version(utils::UUID(msb, lsb));
-    }
 
 public:
     explicit record_value_reader(Input& in)
@@ -81,18 +83,84 @@ public:
 
     table_schema_version schema_version() const noexcept { return _schema_version; }
 
-    column_mapping read_mapping() {
-        return ser::deserialize(_in, std::type_identity<column_mapping>{});
-    }
-
-    void skip_mapping() {
-        ser::skip(_in, std::type_identity<column_mapping>{});
-    }
-
     ser::mutation_partition_view read_partition() {
         return ser::deserialize(_in, std::type_identity<ser::mutation_partition_view>{});
     }
 };
+
+// std::hash<utils::UUID> xors the halves, so time-UUIDs made in a row share buckets.
+struct schema_version_hash {
+    size_t operator()(table_schema_version v) const noexcept {
+        return absl::HashOf(v.uuid().get_most_significant_bits(), v.uuid().get_least_significant_bits());
+    }
+};
+
+// Not absl::flat_hash_map: release builds keep its debug checks, which cost on every lookup.
+// Node based, so entries keep their address.
+using known_schema_map = std::unordered_map<table_schema_version, known_schema, schema_version_hash>;
+
+known_schema_map& known_schemas() noexcept {
+    static thread_local known_schema_map schemas;
+    return schemas;
+}
+
+// The schema frame of a value, padded, so that an append copies it as is.
+bytes make_schema_frame(bytes_view value) {
+    bytes frame(bytes::initialized_later(), align_up(ondisk::schema_frame_size(value.size()), ondisk::record_alignment));
+    auto out = simple_memory_output_stream(reinterpret_cast<char*>(frame.data()), frame.size());
+    ondisk::write_schema_frame(out, value);
+    out.fill('\0', out.size());
+    return frame;
+}
+
+bytes make_schema_frame(table_schema_version v, table_id table, const column_mapping& cm) {
+    bytes_ostream out;
+    write_schema_version(out, v);
+    ser::serialize(out, table);
+    ser::serialize(out, cm);
+    return make_schema_frame(out.linearize());
+}
+
+// The value of an entry's schema frame, without the frame header and the padding.
+bytes_view schema_frame_value(const known_schema& k) {
+    auto in = simple_memory_input_stream(reinterpret_cast<const char*>(k.schema_frame.data()), ondisk::record_frame_header_size);
+    const auto fh = ser::deserialize(in, std::type_identity<ondisk::record_frame_header>{});
+    return bytes_view(k.schema_frame).substr(ondisk::record_frame_header_size, fh.value_size);
+}
+
+// The entry the last encoded record remembered: the record's writer looks it up next, and the
+// next record is most often of the same version, so both skip the map.
+const known_schema*& last_remembered() noexcept {
+    static thread_local const known_schema* last = nullptr;
+    return last;
+}
+
+void remember_column_mapping(const schema& s) {
+    auto& last = last_remembered();
+    if (last && last->version == s.version()) {
+        return;
+    }
+    auto& schemas = known_schemas();
+    auto it = schemas.find(s.version());
+    const auto& cm = s.get_column_mapping();
+    if (it == schemas.end()) {
+        it = schemas.emplace(s.version(), known_schema{s.version(), s.id(), cm, make_schema_frame(s.version(), s.id(), cm), 0, true}).first;
+    } else if (!it->second.verified) [[unlikely]] {
+        auto& k = it->second;
+        if (k.table != s.id() || k.mapping != cm) {
+            logstor_logger.warn("Schema version {} was remembered from a schema frame of table {} that differs from the live schema of table {}; replacing it",
+                    s.version(), k.table, s.id());
+            // In place: buffers and writers hold pointers to the entry.
+            k.table = s.id();
+            k.mapping = cm;
+            k.schema_frame = make_schema_frame(s.version(), s.id(), cm);
+            // No chunk holds this frame yet, so buffers that wrote the old one write it again.
+            k.chunk_stamp = 0;
+        }
+        k.verified = true;
+    }
+    last = &it->second;
+}
 
 // Returns the serialized partition of a frozen mutation.
 ser::mutation_partition_view frozen_partition(const frozen_mutation& m) {
@@ -165,12 +233,14 @@ api::timestamp_type record_timestamp(const frozen_mutation& m) {
 }
 
 record_value encode_record_value(const mutation& m) {
+    remember_column_mapping(*m.schema());
     bytes_ostream out;
     write_record_value(out, *m.schema(), m.partition());
     return record_value(std::move(out));
 }
 
 record_value encode_record_value(const frozen_mutation& m, const schema& s) {
+    remember_column_mapping(s);
     bytes_ostream out;
     write_record_value(out, s, frozen_partition(m));
     return record_value(std::move(out));
@@ -181,24 +251,86 @@ single_row_partition decode_record_value(const record_value& v, const schema& s,
         throw std::runtime_error(format("logstor: record of table {} decoded with the schema of table {} ({}.{})",
                 h.table, s.id(), s.ks_name(), s.cf_name()));
     }
-
     auto in = ser::as_input_stream(v.representation());
     record_value_reader reader(in);
 
     // Decode into a mutation_partition, then move the row out of it.
     mutation_partition p(s);
     if (reader.schema_version() == s.version()) {
-        reader.skip_mapping();
         auto partition_view = mutation_partition_view::from_view(reader.read_partition());
         partition_builder b(s, p);
         partition_view.accept(s, b);
     } else {
-        column_mapping cm = reader.read_mapping();
-        converting_mutation_partition_applier applier(cm, s, p);
+        const known_schema* known = find_known_schema(reader.schema_version());
+        if (!known || known->table != h.table) [[unlikely]] {
+            throw std::runtime_error(format("logstor: no column mapping for schema version {} of a record of table {}.{}{}",
+                    reader.schema_version(), s.ks_name(), s.cf_name(),
+                    known ? format(": the version belongs to table {}", known->table) : ""));
+        }
+        converting_mutation_partition_applier applier(known->mapping, s, p);
         auto partition_view = mutation_partition_view::from_view(reader.read_partition());
-        partition_view.accept(cm, applier);
+        partition_view.accept(known->mapping, applier);
     }
     return to_single_row_partition(std::move(p), s, h.key.key());
+}
+
+table_schema_version record_schema_version(bytes_view value) {
+    auto in = simple_memory_input_stream(reinterpret_cast<const char*>(value.data()), value.size());
+    return read_schema_version(in);
+}
+
+table_schema_version record_schema_version(const record_value& v) {
+    auto in = ser::as_input_stream(v.representation());
+    return read_schema_version(in);
+}
+
+const known_schema* remember_schema_frame(bytes_view value) {
+    auto in = simple_memory_input_stream(reinterpret_cast<const char*>(value.data()), value.size());
+    const auto v = read_schema_version(in);
+    const auto table = ser::deserialize(in, std::type_identity<table_id>{});
+    auto& schemas = known_schemas();
+    auto it = schemas.find(v);
+    if (it != schemas.end() && schema_frame_value(it->second) == value) [[likely]] {
+        return &it->second;
+    }
+    auto cm = ser::deserialize(in, std::type_identity<column_mapping>{});
+    if (in.size() != 0) {
+        throw std::runtime_error(format("logstor: schema frame of version {} has {} bytes past its column mapping", v, in.size()));
+    }
+    if (it == schemas.end()) {
+        it = schemas.emplace(v, known_schema{v, table, std::move(cm), make_schema_frame(value)}).first;
+    } else if (table != it->second.table || cm != it->second.mapping) {
+        // Equal mappings can still differ in bytes, e.g. in how type names are written.
+        throw std::runtime_error(format("logstor: schema version {} has two different column mappings, or tables {} and {}",
+                v, it->second.table, table));
+    }
+    return &it->second;
+}
+
+const known_schema* find_known_schema(table_schema_version v) noexcept {
+    if (const auto* last = last_remembered(); last && last->version == v) {
+        return last;
+    }
+    auto& schemas = known_schemas();
+    auto it = schemas.find(v);
+    return it != schemas.end() ? &it->second : nullptr;
+}
+
+schema_frame_stats& get_schema_frame_stats() noexcept {
+    static thread_local schema_frame_stats stats;
+    return stats;
+}
+
+size_t known_column_mapping_count() noexcept {
+    return known_schemas().size();
+}
+
+void forget_column_mappings() {
+    // Retired, not freed: buffers and writers may still point to the entries.
+    static thread_local std::vector<known_schema_map> retired;
+    retired.push_back(std::move(known_schemas()));
+    known_schemas().clear();
+    last_remembered() = nullptr;
 }
 
 } // namespace replica::logstor

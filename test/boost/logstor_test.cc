@@ -24,9 +24,13 @@
 #include <seastar/core/format.hh>
 #include <seastar/core/temporary_buffer.hh>
 #include <seastar/util/memory-data-source.hh>
+#include <seastar/core/on_internal_error.hh>
 #include <seastar/util/defer.hh>
 
 #include "mutation/canonical_mutation.hh"
+#include "mutation/mutation_partition_serializer.hh"
+#include "idl/mutation.dist.hh"
+#include "idl/mutation.dist.impl.hh"
 #include "replica/exceptions.hh"
 #include "replica/logstor/compaction_policy.hh"
 #include "replica/logstor/index.hh"
@@ -40,6 +44,7 @@
 #include "replica/logstor/segment_io.hh"
 #include "replica/database.hh"
 #include "schema/schema_builder.hh"
+#include "utils/UUID_gen.hh"
 #include "schema/schema_registry.hh"
 #include "data_dictionary/user_types_metadata.hh"
 #include "db/config.hh"
@@ -144,7 +149,7 @@ std::optional<segment_info> read_segment_info_from_bytes(const temporary_buffer<
     temporary_buffer<char> copy(buf.size());
     std::copy_n(buf.get(), buf.size(), copy.get_write());
     auto in = seastar::util::as_input_stream(std::move(copy));
-    auto header = read_segment_info(in).get();
+    auto header = read_segment_info(in, log_segment_id{0}).get();
     in.close().get();
     return header;
 }
@@ -435,6 +440,12 @@ size_t record_size_with_value(schema_ptr schema, const sstring& pk, size_t value
     return log_record_writer(make_log_record(schema, pk, sstring(value_size, 'x'))).record_size();
 }
 
+// The room the schema frame of the schema takes ahead of the first record of its version in a chunk.
+size_t schema_frame_space(schema_ptr schema) {
+    auto writer = log_record_writer(make_log_record(schema, "pk", ""));
+    return raw_write_buffer::schema_frame_space(writer.schema());
+}
+
 // Builds a mutation whose log record serializes to exactly `record_size` bytes, by sizing its value
 // to whatever is left over. The serialized size grows by a byte per value byte, apart from the
 // value's length prefix, so this converges in a step or two.
@@ -505,10 +516,21 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_ondisk_serialized_sizes) {
         .last_token = dht::token::from_int64(0x7fffffffffffffff),
     });
 
-    check_serialized_size("record_frame_header", ondisk::record_frame_header {
-        .key_size = 0x0a0b0c0d,
+    const ondisk::record_frame_header frame_header {
+        .key_size = 0x0a0b,
+        .kind = static_cast<frame_kind>(0x0c),
+        .reserved = 0x0d,
         .value_size = 0xcafebabe,
-    });
+    };
+    check_serialized_size("record_frame_header", frame_header);
+
+    // The fields in order, each little-endian.
+    std::array<char, ondisk::record_frame_header_size> frame_header_bytes;
+    seastar::simple_memory_output_stream out(frame_header_bytes.data(), frame_header_bytes.size());
+    ser::serializer<ondisk::record_frame_header>::write(out, frame_header);
+    BOOST_REQUIRE_EQUAL(out.size(), 0u);
+    const std::array<uint8_t, ondisk::record_frame_header_size> expected_bytes {0x0b, 0x0a, 0x0c, 0x0d, 0xbe, 0xba, 0xfe, 0xca};
+    BOOST_REQUIRE(std::ranges::equal(frame_header_bytes, expected_bytes, {}, [] (char c) { return uint8_t(c); }));
 }
 
 // Serializes a record frame and returns its bytes, checking that the frame took exactly the size
@@ -577,7 +599,9 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_record_frame_invalid_header) {
     auto record = make_log_record(schema, "pk0", "a-value-of-some-length", api::timestamp_type(1));
     const auto frame = serialize_record_frame(record);
     const ondisk::record_frame_header good {
-        .key_size = uint32_t(record.header.key.key().representation().size()),
+        .key_size = uint16_t(record.header.key.key().representation().size()),
+        .kind = frame_kind::mutation,
+        .reserved = 0,
         .value_size = uint32_t(record.value.size()),
     };
 
@@ -596,7 +620,11 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_record_frame_invalid_header) {
     BOOST_REQUIRE_THROW(read_with_header(h), std::runtime_error);
 
     h = good;
-    h.key_size = ondisk::max_key_size + 1;
+    h.kind = static_cast<frame_kind>(0xff);
+    BOOST_REQUIRE_THROW(read_with_header(h), std::runtime_error);
+
+    h = good;
+    h.reserved = 1;
     BOOST_REQUIRE_THROW(read_with_header(h), std::runtime_error);
 
     for (int delta : {-1, 1}) {
@@ -608,6 +636,19 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_record_frame_invalid_header) {
         h.value_size += delta;
         BOOST_REQUIRE_THROW(read_with_header(h), std::runtime_error);
     }
+}
+
+// Checks that a frame header whose value is too short for its kind's fixed fields is invalid.
+SEASTAR_THREAD_TEST_CASE(test_logstor_frame_value_size_per_kind) {
+    auto valid = [] (frame_kind kind, uint16_t key_size, size_t value_size) {
+        return ondisk::validate_record_frame_header({.key_size = key_size, .kind = kind, .reserved = 0, .value_size = uint32_t(value_size)});
+    };
+    BOOST_REQUIRE(!valid(frame_kind::mutation, 3, ondisk::schema_version_size - 1));
+    BOOST_REQUIRE(valid(frame_kind::mutation, 3, ondisk::schema_version_size));
+    BOOST_REQUIRE(!valid(frame_kind::schema, 0, ondisk::min_schema_frame_value_size));
+    BOOST_REQUIRE(valid(frame_kind::schema, 0, ondisk::min_schema_frame_value_size + 1));
+    BOOST_REQUIRE(!valid(frame_kind::schema, 1, ondisk::min_schema_frame_value_size + 1));
+    BOOST_REQUIRE(!valid(frame_kind::mutation, 0, 0));
 }
 
 // Checks that the record header encoding round-trips, including a key longer than the inline size of
@@ -669,6 +710,8 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_write_buffer_record_and_header_serializati
     auto writer = log_record_writer(expected);
     auto expected_records_size = size_t(ondisk::record_frame_header_size) + writer.record_size();
     expected_records_size = ((expected_records_size + ondisk::record_alignment - 1) / ondisk::record_alignment) * ondisk::record_alignment;
+    // The record is the first of its schema version in the chunk.
+    expected_records_size += raw_write_buffer::schema_frame_space(writer.schema());
     wb.append(std::move(writer));
     wb.seal(segment_sequence{17}, schema->id(), ondisk::block_alignment);
 
@@ -752,7 +795,8 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_record_value_round_trip) {
 
 // Checks that a record written under one schema version reads under another the way a
 // canonical_mutation does: a column the record has and the schema does not is dropped, a column
-// the schema has and the record does not is absent.
+// the schema has and the record does not is absent. The mapping comes from what the shard knows
+// of the version, and a record of a version the shard does not know reads under that version only.
 SEASTAR_THREAD_TEST_CASE(test_logstor_record_value_decodes_under_another_schema_version) {
     auto schema = make_multi_column_schema();
     const auto ts = api::timestamp_type(21);
@@ -761,21 +805,31 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_record_value_decodes_under_another_schema_
     auto value = encode_record_value(m);
     auto header = make_header(m, ts);
     auto oracle = canonical_mutation(m);
+    BOOST_REQUIRE(find_known_schema(schema->version()));
 
     auto with_added = schema_builder(schema).with_column("y", long_type).build();
-    BOOST_REQUIRE(with_added->version() != schema->version());
-    assert_that(decode_to_mutation(value, with_added, header)).is_equal_to(oracle.to_mutation(with_added));
-    assert_that(decode_to_mutation(value, with_added, header)).is_equal_to(m);
-
     auto with_dropped = schema_builder(schema).without_column("w", ts + 1).build();
+    BOOST_REQUIRE(with_added->version() != schema->version());
     BOOST_REQUIRE(with_dropped->version() != schema->version());
-    auto decoded = decode_to_mutation(value, with_dropped, header);
-    assert_that(decoded).is_equal_to(oracle.to_mutation(with_dropped));
-    // Of the three cells written, the one of the dropped column is gone.
-    const auto& cells = decoded.partition().clustered_row(*with_dropped, clustering_key::make_empty()).cells();
-    BOOST_REQUIRE(cells.find_cell(with_dropped->get_column_definition("v")->id) != nullptr);
-    BOOST_REQUIRE(cells.find_cell(with_dropped->get_column_definition("x")->id) != nullptr);
-    BOOST_REQUIRE_EQUAL(cells.size(), 2u);
+
+    auto check = [&] {
+        assert_that(decode_to_mutation(value, with_added, header)).is_equal_to(oracle.to_mutation(with_added));
+        assert_that(decode_to_mutation(value, with_added, header)).is_equal_to(m);
+
+        auto decoded = decode_to_mutation(value, with_dropped, header);
+        assert_that(decoded).is_equal_to(oracle.to_mutation(with_dropped));
+        // Of the three cells written, the one of the dropped column is gone.
+        const auto& cells = decoded.partition().clustered_row(*with_dropped, clustering_key::make_empty()).cells();
+        BOOST_REQUIRE(cells.find_cell(with_dropped->get_column_definition("v")->id) != nullptr);
+        BOOST_REQUIRE(cells.find_cell(with_dropped->get_column_definition("x")->id) != nullptr);
+        BOOST_REQUIRE_EQUAL(cells.size(), 2u);
+    };
+    check();
+
+    forget_column_mappings();
+    BOOST_REQUIRE(!find_known_schema(schema->version()));
+    BOOST_REQUIRE_THROW(decode_to_mutation(value, with_added, header), std::runtime_error);
+    assert_that(decode_to_mutation(value, schema, header)).is_equal_to(m);
 }
 
 // Checks that a value is not decoded with the schema of another table: the table id comes from the
@@ -908,12 +962,13 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_writes_a_frozen_mutation) {
             schema_mismatch_error);
 }
 
-// Checks that a raw write buffer can hold and seal a record whose serialized size is exactly max_record_size().
+// Checks that a raw write buffer can hold and seal a record whose serialized size is exactly
+// max_record_size(), less the schema frame it needs.
 SEASTAR_THREAD_TEST_CASE(test_logstor_write_buffer_accepts_record_at_max_record_size) {
     auto schema = make_kv_schema();
 
     raw_write_buffer wb(ondisk::block_alignment, segment_kind::mixed);
-    auto max_size = wb.max_record_size();
+    auto max_size = wb.max_record_size() - schema_frame_space(schema);
 
     sstring value;
     auto record = make_log_record(schema, "pk", "", api::timestamp_type(27));
@@ -951,7 +1006,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_largest_accepted_record_can_be_separated) 
     test_logstor_group cg(schema, ls);
 
     const auto segment_size = ls.get_segment_manager().get_segment_size();
-    const auto max_size = raw_write_buffer::max_record_size_any_kind(segment_size);
+    const auto max_size = raw_write_buffer::max_record_size_any_kind(segment_size) - schema_frame_space(schema);
 
     auto expected = make_kv_mutation_of_record_size(schema, "pk0", max_size);
     auto key = expected.decorated_key();
@@ -1000,7 +1055,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_rejects_record_that_does_not_fit_a_segment
     test_logstor_group cg(schema, ls);
 
     const auto segment_size = ls.get_segment_manager().get_segment_size();
-    const auto max_size = raw_write_buffer::max_record_size_any_kind(segment_size);
+    const auto max_size = raw_write_buffer::max_record_size_any_kind(segment_size) - schema_frame_space(schema);
 
     auto too_big = make_kv_mutation_of_record_size(schema, "pk0", max_size + 1);
     BOOST_REQUIRE_THROW(ls.write(too_big, write_target(&cg, {}), db::no_timeout).get(), std::runtime_error);
@@ -1604,11 +1659,12 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_segment_scan_mixed_chunks_report_readable_
     BOOST_REQUIRE(std::holds_alternative<segment_info::mixed>(maybe_header->v));
 }
 
-// Checks that scan_segment() stops at a record whose key_size is corrupt instead of trusting it, and
-// resumes with the next chunk of a mixed segment.
+// Checks that scan_segment() fails on a record whose frame header is corrupt in a chunk whose body
+// CRC matches, instead of trusting it or taking it for the end of the chunk.
 SEASTAR_THREAD_TEST_CASE(test_logstor_segment_scan_rejects_corrupt_key_size) {
     auto schema = make_kv_schema();
 
+    // Overwrites the key_size, kind and reserved fields of the first record frame with one 32-bit word.
     auto scan_with_corrupt_key_size = [&] (uint32_t key_size) {
         raw_write_buffer wb0(64 * 1024, segment_kind::mixed);
         raw_write_buffer wb1(64 * 1024, segment_kind::mixed);
@@ -1620,8 +1676,8 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_segment_scan_rejects_corrupt_key_size) {
 
         auto serialized0 = copy_chunk(wb0.chunk());
         auto serialized1 = copy_chunk(wb1.chunk());
-        // The first record_frame_header of the first chunk follows the chunk header; key_size is its first field.
-        seastar::simple_memory_output_stream out(serialized0.get_write() + ondisk::chunk_header_size, sizeof(uint32_t));
+        // The first record frame follows the chunk header and the schema frame of its version; key_size is the first field.
+        seastar::simple_memory_output_stream out(serialized0.get_write() + ondisk::chunk_header_size + schema_frame_space(schema), sizeof(uint32_t));
         ser::serialize(out, key_size);
         // The corruption is in the records, which is what the body CRC would catch first.
         reseal_chunk_crcs(serialized0);
@@ -1630,31 +1686,26 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_segment_scan_rejects_corrupt_key_size) {
         const auto segment_size = segment.size();
         auto in = seastar::util::as_input_stream(std::move(segment));
 
-        std::vector<api::timestamp_type> seen;
+        auto close_in = seastar::defer([&in] noexcept { in.close().get(); });
         scan_segment(in, log_segment_id{5}, segment_size,
             [] (const segment_info&) {
                 return make_ready_future<>();
             },
-            [&seen] (record_location, const record_header& header) {
-                seen.push_back(header.timestamp);
+            [] (record_location, const record_header&) {
                 return want_data::no;
             },
             [] (record_location, log_record) {
                 return make_ready_future<>();
             }).get();
-        in.close().get();
-        return seen;
     };
+    auto invalid_frame = [] (const std::runtime_error& e) { return std::string_view(e.what()).contains("invalid frame"); };
 
-    // Above the partition key size cap: rejected by validate_record_frame_header().
-    auto seen = scan_with_corrupt_key_size(ondisk::max_key_size + 1);
-    BOOST_REQUIRE_EQUAL(seen.size(), 1u);
-    BOOST_REQUIRE_EQUAL(seen[0], api::timestamp_type(33));
-
+    // A reserved byte that is not zero: rejected by validate_record_frame_header().
+    BOOST_REQUIRE_EXCEPTION(scan_with_corrupt_key_size(uint32_t(1) << 24), std::runtime_error, invalid_frame);
+    // An unknown frame kind.
+    BOOST_REQUIRE_EXCEPTION(scan_with_corrupt_key_size(uint32_t(0x7f) << 16), std::runtime_error, invalid_frame);
     // Within the cap but past the end of the chunk: rejected by the size check.
-    seen = scan_with_corrupt_key_size(ondisk::max_key_size);
-    BOOST_REQUIRE_EQUAL(seen.size(), 1u);
-    BOOST_REQUIRE_EQUAL(seen[0], api::timestamp_type(33));
+    BOOST_REQUIRE_EXCEPTION(scan_with_corrupt_key_size(ondisk::max_key_size), std::runtime_error, invalid_frame);
 }
 
 // Checks that scan_segment() only delivers records whose headers were accepted with want_data::yes.
@@ -3149,6 +3200,43 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_select_compaction_batch) {
     BOOST_REQUIRE(!select_compaction_batch(empty, segment_size, compaction_batch_limits{.batch_cap = min_segments_per_compaction}));
 }
 
+// Checks that the segment estimate counts the schema frames a segment holds: a batch that just fits
+// one segment needs more once frames take their share, and the frames never take the whole segment.
+SEASTAR_THREAD_TEST_CASE(test_logstor_estimate_required_segments_counts_schema_frames) {
+    constexpr size_t segment_size = 128 * 1024;
+    constexpr size_t record_count = 100;
+    constexpr size_t record_bytes = record_count * 1000;
+    const auto estimate = [&] (size_t schema_frame_bytes) {
+        return raw_write_buffer::estimate_required_segments(record_bytes, record_count, segment_size, segment_kind::full, schema_frame_bytes);
+    };
+
+    BOOST_REQUIRE_EQUAL(estimate(0), 1u);
+    BOOST_REQUIRE_EQUAL(raw_write_buffer::estimate_required_segments(record_bytes, record_count, segment_size, segment_kind::full), 1u);
+    BOOST_REQUIRE_EQUAL(estimate(1024), 1u);
+    BOOST_REQUIRE_EQUAL(estimate(40 * 1024), 2u);
+    // Capped at half of what the segment has for records, which fits half the records.
+    BOOST_REQUIRE_EQUAL(estimate(segment_size), 2u);
+    BOOST_REQUIRE_EQUAL(estimate(10 * segment_size), 2u);
+
+    // The batch selection takes the estimate.
+    constexpr size_t record_size = 1024;
+    std::deque<segment_descriptor> descs;
+    segment_set segments{segment_size};
+    for (size_t i = 0; i < 4; ++i) {
+        auto& desc = descs.emplace_back();
+        desc.reset(segment_size);
+        desc.on_write(20 * record_size, 20);
+        segments.add_segment(desc);
+    }
+    auto without = select_compaction_batch(segments, segment_size, compaction_batch_limits{.batch_cap = 4});
+    auto with = select_compaction_batch(segments, segment_size, compaction_batch_limits{.batch_cap = 4}, 100 * 1024);
+    BOOST_REQUIRE(without);
+    BOOST_REQUIRE_EQUAL(without->score.n_out, 1u);
+    BOOST_REQUIRE(with);
+    // The frames take room in the output, so the longest batch no longer pays.
+    BOOST_REQUIRE_LT(with->score.n_in, without->score.n_in);
+}
+
 // A segment set does not walk its segments to get its statistics. It updates them when it links or
 // unlinks a segment, and when a record is freed. Thus, each of these paths must keep the statistics
 // equal to the segments in the set, and to the shard-wide statistics.
@@ -4367,4 +4455,660 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_range_reader_serves_a_reversed_read) {
             env.make_reader(query::full_partition_range, bypassing));
     BOOST_REQUIRE_EQUAL(stats.partition_hits, hits + ms.size());
     BOOST_REQUIRE_EQUAL(stats.partition_misses, misses);
+}
+
+namespace {
+
+// A frame of a chunk body, as the scan sees it.
+struct chunk_frame {
+    frame_kind kind;
+    // The version a schema frame holds, or that a record refers to.
+    std::optional<table_schema_version> schema_version;
+    // The bytes of a schema frame, padding included; empty for a record.
+    bytes raw;
+};
+
+// The frames of a sealed chunk, in order.
+std::vector<chunk_frame> list_chunk_frames(bytes_view chunk) {
+    seastar::simple_memory_input_stream header_in(reinterpret_cast<const char*>(chunk.data()), chunk.size());
+    const auto ch = ser::deserialize(header_in, std::type_identity<ondisk::chunk_header>{});
+    const auto body_offset = raw_write_buffer::chunk_headers_size(ch.kind);
+    seastar::simple_memory_input_stream in(reinterpret_cast<const char*>(chunk.data()) + body_offset, ch.records_size);
+
+    std::vector<chunk_frame> frames;
+    while (in.size() > 0) {
+        const auto before = in.size();
+        const auto* frame_start = reinterpret_cast<const int8_t*>(in.begin());
+        const auto fh = ser::deserialize(in, std::type_identity<ondisk::record_frame_header>{});
+        BOOST_REQUIRE(ondisk::validate_record_frame_header(fh));
+        in.skip(ondisk::record_header_size(fh));
+        const auto value = bytes_view(reinterpret_cast<const int8_t*>(in.begin()), fh.value_size);
+        in.skip(fh.value_size);
+        const auto consumed = before - in.size();
+        const auto aligned_size = align_up(consumed, ondisk::record_alignment);
+        if (fh.kind == frame_kind::schema) {
+            auto vin = seastar::simple_memory_input_stream(reinterpret_cast<const char*>(value.data()), value.size());
+            const auto msb = ser::serializer<int64_t>::read(vin);
+            const auto lsb = ser::serializer<int64_t>::read(vin);
+            frames.push_back({fh.kind, table_schema_version(utils::UUID(msb, lsb)), bytes(frame_start, aligned_size)});
+        } else {
+            frames.push_back({fh.kind, record_schema_version(value)});
+        }
+        in.skip(aligned_size - consumed);
+    }
+    return frames;
+}
+
+log_record make_log_record(const mutation& m, record_value value) {
+    return log_record{
+        .header = make_header(m, record_timestamp(m)),
+        .value = std::move(value),
+    };
+}
+
+// Reads every record of the group back, under the schema s, and checks it against the mutation
+// written under its own schema.
+void check_reads_under(logstor& ls, test_logstor_group& cg, schema_ptr s, const std::vector<mutation>& expected) {
+    for (const auto& m : expected) {
+        auto actual = read_mutation(ls, s, cg.logstor_index(), m.decorated_key(), s->full_slice()).get();
+        BOOST_REQUIRE(actual);
+        assert_that(*actual).is_equal_to(canonical_mutation(m).to_mutation(s));
+    }
+}
+
+// Forgets what the shard knows of schema versions, and scans the segments of the group the way
+// recovery does, which is the only place the scan can learn them from. Every chunk must hold the
+// schema frames its records need (I1), and every schema frame must be readable.
+void forget_and_rescan(logstor& ls, test_logstor_group& cg) {
+    forget_column_mappings();
+    const auto before = get_schema_frame_stats();
+    auto snapshot = ls.get_segment_manager().make_snapshot(cg).get();
+    count_records_by_timestamp(ls, snapshot);
+    BOOST_REQUIRE_EQUAL(get_schema_frame_stats().skipped, before.skipped);
+    BOOST_REQUIRE_EQUAL(get_schema_frame_stats().records_without_frame, before.records_without_frame);
+}
+
+} // anonymous namespace
+
+// Checks that a chunk holds one schema frame per schema version, ahead of the first record of that
+// version, and that the records themselves carry no column mapping.
+SEASTAR_THREAD_TEST_CASE(test_logstor_chunk_has_one_schema_frame_per_version) {
+    auto v1 = make_multi_column_schema();
+    auto v2 = schema_builder(v1).with_column("y", long_type).build();
+
+    std::vector<mutation> ms;
+    ms.push_back(make_multi_column_mutation(v1, "pk0", api::timestamp_type(1)));
+    ms.push_back(make_multi_column_mutation(v1, "pk1", api::timestamp_type(2)));
+    ms.push_back(make_multi_column_mutation(v2, "pk2", api::timestamp_type(3)));
+    ms.push_back(make_multi_column_mutation(v1, "pk3", api::timestamp_type(4)));
+    ms.push_back(make_multi_column_mutation(v2, "pk4", api::timestamp_type(5)));
+
+    for (auto kind : {segment_kind::mixed, segment_kind::full}) {
+        const auto frame_bytes_before = get_schema_frame_stats().bytes_written;
+        raw_write_buffer wb(64 * 1024, kind);
+        std::vector<raw_write_buffer::append_result> appended;
+        for (const auto& m : ms) {
+            appended.push_back(wb.append(log_record_writer(make_log_record(m, encode_record_value(m)))));
+        }
+        wb.seal(segment_sequence{3}, v1->id(), ondisk::block_alignment);
+        BOOST_REQUIRE_EQUAL(wb.record_count(), ms.size());
+        BOOST_REQUIRE_GT(get_schema_frame_stats().bytes_written, frame_bytes_before);
+
+        const auto frames = list_chunk_frames(wb.chunk());
+        const std::vector<std::pair<frame_kind, table_schema_version>> expected_frames = {
+            {frame_kind::schema, v1->version()},
+            {frame_kind::mutation, v1->version()},
+            {frame_kind::mutation, v1->version()},
+            {frame_kind::schema, v2->version()},
+            {frame_kind::mutation, v2->version()},
+            {frame_kind::mutation, v1->version()},
+            {frame_kind::mutation, v2->version()},
+        };
+        BOOST_REQUIRE_EQUAL(frames.size(), expected_frames.size());
+        for (size_t i = 0; i < frames.size(); ++i) {
+            BOOST_REQUIRE(frames[i].kind == expected_frames[i].first);
+            BOOST_REQUIRE(frames[i].schema_version == expected_frames[i].second);
+        }
+
+        // Each record is where its append said, and reads under either version.
+        auto chunk = copy_chunk(wb.chunk());
+        for (size_t i = 0; i < ms.size(); ++i) {
+            auto loc = locate_record(segment_position{log_segment_id{0}, 0}, appended[i].frame_offset, appended[i].frame_size);
+            auto record = read_record_at_location(chunk, loc);
+            for (auto s : {v1, v2}) {
+                assert_that(to_mutation(record, s)).is_equal_to(canonical_mutation(ms[i]).to_mutation(s));
+            }
+        }
+    }
+}
+
+// Checks that a buffer whose chunk is older than the version's last stamp still writes the schema
+// frame once, when the version was last put in a newer buffer's chunk.
+SEASTAR_THREAD_TEST_CASE(test_logstor_chunk_has_one_schema_frame_when_version_is_in_newer_chunk) {
+    auto s = make_multi_column_schema();
+    raw_write_buffer wb0(64 * 1024, segment_kind::mixed);
+    raw_write_buffer wb1(64 * 1024, segment_kind::mixed);
+
+    for (auto* wb : {&wb1, &wb0, &wb0}) {
+        auto m = make_multi_column_mutation(s, fmt::format("pk{}", wb->record_count()), api::timestamp_type(1));
+        wb->append(log_record_writer(make_log_record(m, encode_record_value(m))));
+    }
+    wb0.seal(segment_sequence{3}, std::nullopt, ondisk::block_alignment);
+    wb1.seal(segment_sequence{3}, std::nullopt, ondisk::block_alignment);
+
+    const auto frames0 = list_chunk_frames(wb0.chunk());
+    BOOST_REQUIRE_EQUAL(frames0.size(), 3u);
+    BOOST_REQUIRE(frames0[0].kind == frame_kind::schema);
+    BOOST_REQUIRE(frames0[0].schema_version == s->version());
+    BOOST_REQUIRE(frames0[1].kind == frame_kind::mutation);
+    BOOST_REQUIRE(frames0[2].kind == frame_kind::mutation);
+
+    const auto frames1 = list_chunk_frames(wb1.chunk());
+    BOOST_REQUIRE_EQUAL(frames1.size(), 2u);
+    BOOST_REQUIRE(frames1[0].kind == frame_kind::schema);
+    BOOST_REQUIRE(frames1[1].kind == frame_kind::mutation);
+}
+
+// Checks that a buffer reports the bytes of the schema frames it appended, one frame per version,
+// and that a group averages them over the segments compaction wrote.
+SEASTAR_THREAD_TEST_CASE(test_logstor_schema_frame_bytes_of_buffer_and_group) {
+    forget_column_mappings();
+    auto reset_mappings = seastar::defer([] noexcept { forget_column_mappings(); });
+    auto v1 = make_multi_column_schema();
+    auto v2 = schema_builder(v1).with_column("y", long_type).build();
+
+    raw_write_buffer wb(64 * 1024, segment_kind::mixed);
+    BOOST_REQUIRE_EQUAL(wb.schema_frame_bytes(), 0u);
+    auto append = [&] (schema_ptr s, sstring pk) {
+        auto m = make_multi_column_mutation(s, pk, api::timestamp_type(1));
+        wb.append(log_record_writer(make_log_record(m, encode_record_value(m))));
+    };
+    append(v1, "pk0");
+    const auto f1 = find_known_schema(v1->version())->schema_frame.size();
+    BOOST_REQUIRE_EQUAL(wb.schema_frame_bytes(), f1);
+    append(v1, "pk1");
+    BOOST_REQUIRE_EQUAL(wb.schema_frame_bytes(), f1);
+    append(v2, "pk2");
+    const auto f2 = find_known_schema(v2->version())->schema_frame.size();
+    BOOST_REQUIRE_EQUAL(wb.schema_frame_bytes(), f1 + f2);
+    wb.reset();
+    BOOST_REQUIRE_EQUAL(wb.schema_frame_bytes(), 0u);
+
+    tmpdir dir;
+    shared_logstor_cache cache;
+    logstor ls(make_test_logstor_config(dir.path()), cache.shared_tracker);
+    ls.do_recovery_for_test().get();
+    ls.start().get();
+    auto stop_store = seastar::defer([&ls] noexcept { ls.stop().get(); });
+    test_logstor_group cg(v1, ls);
+    auto setup_guard = std::make_optional(ls.get_compaction_manager().disable_compaction(cg).get());
+
+    // The separator's segments do not count: only compaction's outputs do.
+    BOOST_REQUIRE_EQUAL(cg.schema_frame_bytes(), 0u);
+    write_and_flush_segment(ls, cg, std::vector<mutation>{make_multi_column_mutation(v1, "pk0", api::timestamp_type(2))});
+    write_and_flush_segment(ls, cg, std::vector<mutation>{
+            make_multi_column_mutation(v1, "pk1", api::timestamp_type(3)),
+            make_multi_column_mutation(v2, "pk2", api::timestamp_type(4))});
+    BOOST_REQUIRE_EQUAL(cg.schema_frame_bytes(), 0u);
+
+    // The output of compaction holds the frames of both versions, and sets the average.
+    setup_guard.reset();
+    ls.get_compaction_manager().submit(cg);
+    auto compaction_guard = ls.get_compaction_manager().disable_compaction(cg).get();
+    BOOST_REQUIRE_EQUAL(cg.logstor_segments().segment_count(), 1u);
+    BOOST_REQUIRE_EQUAL(cg.schema_frame_bytes(), f1 + f2);
+}
+
+// Checks that the group's average of schema frame bytes takes its first sample as it is, and that a
+// zero average decays like any other.
+SEASTAR_THREAD_TEST_CASE(test_logstor_group_schema_frame_bytes_average) {
+    tmpdir dir;
+    shared_logstor_cache cache;
+    logstor ls(make_test_logstor_config(dir.path()), cache.shared_tracker);
+    ls.do_recovery_for_test().get();
+    ls.start().get();
+    auto stop_store = seastar::defer([&ls] noexcept { ls.stop().get(); });
+    test_logstor_group cg(make_multi_column_schema(), ls);
+
+    cg.record_schema_frame_bytes(0);
+    BOOST_REQUIRE_EQUAL(cg.schema_frame_bytes(), 0u);
+    cg.record_schema_frame_bytes(800);
+    BOOST_REQUIRE_EQUAL(cg.schema_frame_bytes(), 100u);
+    cg.record_schema_frame_bytes(0);
+    BOOST_REQUIRE_EQUAL(cg.schema_frame_bytes(), 88u);
+}
+
+// Checks that a chunk holding 40 schema versions has one schema frame per version.
+SEASTAR_THREAD_TEST_CASE(test_logstor_chunk_has_one_schema_frame_per_version_of_many) {
+    auto base = make_multi_column_schema();
+    std::vector<schema_ptr> versions;
+    for (int i = 0; i < 40; ++i) {
+        versions.push_back(schema_builder(base).with_version(table_schema_version(utils::UUID_gen::get_time_UUID())).build());
+    }
+
+    raw_write_buffer wb(128 * 1024, segment_kind::mixed);
+    for (int round = 0; round < 2; ++round) {
+        for (size_t i = 0; i < versions.size(); ++i) {
+            auto m = make_multi_column_mutation(versions[i], fmt::format("pk{}-{}", round, i), api::timestamp_type(1));
+            wb.append(log_record_writer(make_log_record(m, encode_record_value(m))));
+        }
+    }
+    wb.seal(segment_sequence{3}, std::nullopt, ondisk::block_alignment);
+    BOOST_REQUIRE_EQUAL(wb.record_count(), 2 * versions.size());
+
+    std::unordered_map<table_schema_version, int> schema_frames;
+    for (const auto& f : list_chunk_frames(wb.chunk())) {
+        if (f.kind == frame_kind::schema) {
+            ++schema_frames[*f.schema_version];
+        }
+    }
+    BOOST_REQUIRE_EQUAL(schema_frames.size(), versions.size());
+    for (const auto& s : versions) {
+        BOOST_REQUIRE_EQUAL(schema_frames[s->version()], 1);
+    }
+}
+
+// Checks that a schema frame of a known version is accepted when it carries the same table and
+// column mapping, and refused when it carries another, or bytes past its mapping.
+SEASTAR_THREAD_TEST_CASE(test_logstor_schema_frame_of_known_version_must_match) {
+    forget_column_mappings();
+    auto reset_mappings = seastar::defer([] noexcept { forget_column_mappings(); });
+
+    auto s = make_multi_column_schema();
+    auto other = schema_builder(s).with_column("y", int32_type).with_version(s->version()).build();
+    auto frame_value = [] (const schema& s, table_id table) {
+        bytes_ostream out;
+        ser::serializer<int64_t>::write(out, s.version().uuid().get_most_significant_bits());
+        ser::serializer<int64_t>::write(out, s.version().uuid().get_least_significant_bits());
+        ser::serialize(out, table);
+        ser::serialize(out, s.get_column_mapping());
+        return bytes(out.linearize());
+    };
+
+    const auto* entry = remember_schema_frame(frame_value(*s, s->id()));
+    BOOST_REQUIRE(entry->table == s->id());
+    BOOST_REQUIRE(remember_schema_frame(frame_value(*s, s->id())) == entry);
+    BOOST_REQUIRE_THROW(remember_schema_frame(frame_value(*other, s->id())), std::runtime_error);
+    BOOST_REQUIRE_THROW(remember_schema_frame(frame_value(*s, table_id(utils::UUID_gen::get_time_UUID()))), std::runtime_error);
+    BOOST_REQUIRE_THROW(remember_schema_frame(frame_value(*s, s->id()) + bytes(1, int8_t(0))), std::runtime_error);
+    BOOST_REQUIRE(find_known_schema(s->version())->mapping == s->get_column_mapping());
+}
+
+// Checks that a scan of a chunk learns the schema versions of its records from the chunk's schema
+// records, which is how recovery finds the column mappings of the records written before a
+// restart.
+SEASTAR_THREAD_TEST_CASE(test_logstor_scan_learns_column_mappings_from_schema_frames) {
+    auto v1 = make_multi_column_schema();
+    auto v2 = schema_builder(v1).without_column("w", api::timestamp_type(100)).build();
+    auto m = make_multi_column_mutation(v1, "pk0", api::timestamp_type(7));
+
+    raw_write_buffer wb(16 * 1024, segment_kind::mixed);
+    auto appended = wb.append(log_record_writer(make_log_record(m, encode_record_value(m))));
+    wb.seal(segment_sequence{3}, std::nullopt, ondisk::block_alignment);
+    auto chunk = copy_chunk(wb.chunk());
+    auto loc = locate_record(segment_position{log_segment_id{0}, 0}, appended.frame_offset, appended.frame_size);
+
+    forget_column_mappings();
+    BOOST_REQUIRE_EQUAL(known_column_mapping_count(), 0u);
+    // A record of a version the shard does not know reads only under that version.
+    BOOST_REQUIRE_THROW(to_mutation(read_record_at_location(chunk, loc), v2), std::runtime_error);
+    assert_that(to_mutation(read_record_at_location(chunk, loc), v1)).is_equal_to(m);
+
+    auto scanned = scan_buffer_records(chunk, log_segment_id{0});
+    BOOST_REQUIRE_EQUAL(scanned.size(), 1u);
+    BOOST_REQUIRE(scanned[0].location == loc);
+    BOOST_REQUIRE(find_known_schema(v1->version()));
+    BOOST_REQUIRE_EQUAL(known_column_mapping_count(), 1u);
+    assert_that(to_mutation(read_record_at_location(chunk, loc), v2)).is_equal_to(canonical_mutation(m).to_mutation(v2));
+}
+
+// Checks that scanning a chunk of an older format fails loudly instead of looking like the end of
+// the segment.
+SEASTAR_THREAD_TEST_CASE(test_logstor_refuses_version_1_chunk) {
+    auto schema = make_multi_column_schema();
+    auto m = make_multi_column_mutation(schema, "pk0", api::timestamp_type(9));
+    raw_write_buffer wb(16 * 1024, segment_kind::mixed);
+    wb.append(log_record_writer(make_log_record(m, encode_record_value(m))));
+    wb.seal(segment_sequence{3}, std::nullopt, ondisk::block_alignment);
+
+    BOOST_REQUIRE_EQUAL(scan_buffer_records(copy_chunk(wb.chunk()), log_segment_id{7}).size(), 1u);
+    auto chunk = copy_chunk(wb.chunk());
+    auto ch = read_chunk_header(chunk);
+    ch.version = 1;
+    {
+        seastar::simple_memory_output_stream out(chunk.get_write(), ondisk::chunk_header_size);
+        ser::serialize<ondisk::chunk_header>(out, ch);
+    }
+    reseal_chunk_crcs(chunk);
+
+    BOOST_REQUIRE_EXCEPTION(scan_buffer_records(chunk, log_segment_id{7}), std::runtime_error,
+            [] (const std::runtime_error& e) { return std::string_view(e.what()).contains("older logstor format"); });
+
+    // A header with the same magic and version, but a CRC that does not match, is not refused.
+    ch = read_chunk_header(chunk);
+    ch.crc ^= 1;
+    {
+        seastar::simple_memory_output_stream out(chunk.get_write(), ondisk::chunk_header_size);
+        ser::serialize<ondisk::chunk_header>(out, ch);
+    }
+    BOOST_REQUIRE(scan_buffer_records(chunk, log_segment_id{7}).empty());
+}
+
+namespace {
+
+// Scans a chunk and copies its records as bytes into a new chunk, as compaction does.
+temporary_buffer<char> copy_records_as_bytes(const temporary_buffer<char>& chunk) {
+    raw_write_buffer wb(64 * 1024, segment_kind::mixed);
+    auto in = seastar::util::as_input_stream(slice_buffer(chunk, 0, chunk.size()));
+    auto close_in = seastar::defer([&in] noexcept { in.close().get(); });
+    scan_segment(in, log_segment_id{0}, chunk.size(),
+        [] (const segment_info&) {
+            return make_ready_future<>();
+        },
+        [] (record_location, const record_header&) {
+            return want_data::yes;
+        },
+        log_record_bytes_consumer([&wb] (record_location, const record_header& header, log_record_bytes_view record_view) {
+            wb.append(log_record_bytes_writer(header, record_view));
+            return make_ready_future<>();
+        })).get();
+    wb.seal(segment_sequence{4}, std::nullopt, ondisk::block_alignment);
+    return copy_chunk(wb.chunk());
+}
+
+size_t count_schema_frames(const temporary_buffer<char>& chunk) {
+    return std::ranges::count(list_chunk_frames(bytes_view(reinterpret_cast<const int8_t*>(chunk.get()), chunk.size())),
+            frame_kind::schema, &chunk_frame::kind);
+}
+
+// Writes v at offset of the chunk's body, which starts with the schema frame of its first record,
+// and recomputes the chunk's CRCs.
+template <typename T>
+void patch_first_schema_frame(temporary_buffer<char>& chunk, size_t offset, const T& v) {
+    seastar::simple_memory_output_stream out(chunk.get_write() + ondisk::chunk_header_size + ondisk::record_frame_header_size + offset,
+            ser::get_sizeof(v));
+    ser::serialize(out, v);
+    reseal_chunk_crcs(chunk);
+}
+
+} // anonymous namespace
+
+// Checks that a schema frame that does not parse loses no record: the scan goes on past it, and a
+// record of its version still reads under that version. A read or a copy that needs the mapping
+// fails for that record alone, until the shard learns the version elsewhere.
+SEASTAR_THREAD_TEST_CASE(test_logstor_scan_goes_on_past_a_bad_schema_frame) {
+    forget_column_mappings();
+    auto reset_mappings = seastar::defer([] noexcept { forget_column_mappings(); });
+    auto v1 = make_multi_column_schema();
+    auto v2 = schema_builder(v1).with_column("y", long_type).build();
+    auto m1 = make_multi_column_mutation(v1, "pk0", api::timestamp_type(1));
+    auto m2 = make_multi_column_mutation(v2, "pk1", api::timestamp_type(2));
+
+    raw_write_buffer wb(16 * 1024, segment_kind::mixed);
+    wb.append(log_record_writer(make_log_record(m1, encode_record_value(m1))));
+    wb.append(log_record_writer(make_log_record(m2, encode_record_value(m2))));
+    wb.seal(segment_sequence{3}, std::nullopt, ondisk::block_alignment);
+    auto chunk = copy_chunk(wb.chunk());
+    // The column mapping of v1's schema frame claims more bytes than the frame holds.
+    patch_first_schema_frame(chunk, ondisk::min_schema_frame_value_size, uint32_t(0x7fffffff));
+    forget_column_mappings();
+
+    const auto before = get_schema_frame_stats();
+    auto scanned = scan_buffer_records(chunk, log_segment_id{0});
+    BOOST_REQUIRE_EQUAL(scanned.size(), 2u);
+    BOOST_REQUIRE_EQUAL(get_schema_frame_stats().skipped, before.skipped + 1);
+    BOOST_REQUIRE_EQUAL(get_schema_frame_stats().records_without_frame, before.records_without_frame + 1);
+    BOOST_REQUIRE(!find_known_schema(v1->version()));
+    assert_that(to_mutation(scanned[0].record, v1)).is_equal_to(m1);
+    BOOST_REQUIRE_THROW(to_mutation(scanned[0].record, v2), std::runtime_error);
+    assert_that(to_mutation(scanned[1].record, v2)).is_equal_to(m2);
+
+    // A copy carries the record of v1 without a schema frame, and loses nothing.
+    auto without_v1 = copy_records_as_bytes(chunk);
+    BOOST_REQUIRE_EQUAL(count_schema_frames(without_v1), 1u);
+    forget_column_mappings();
+    const auto before_copy_scan = get_schema_frame_stats();
+    scanned = scan_buffer_records(without_v1, log_segment_id{0});
+    BOOST_REQUIRE_EQUAL(scanned.size(), 2u);
+    BOOST_REQUIRE_EQUAL(get_schema_frame_stats().records_without_frame, before_copy_scan.records_without_frame + 1);
+    assert_that(to_mutation(scanned[0].record, v1)).is_equal_to(m1);
+
+    // Once the shard knows v1 again, a copy writes its schema frame, and the copy is whole.
+    encode_record_value(m1);
+    auto copied = copy_records_as_bytes(chunk);
+    BOOST_REQUIRE_EQUAL(count_schema_frames(copied), 2u);
+    forget_column_mappings();
+    scanned = scan_buffer_records(copied, log_segment_id{0});
+    BOOST_REQUIRE_EQUAL(scanned.size(), 2u);
+    assert_that(to_mutation(scanned[0].record, v2)).is_equal_to(canonical_mutation(m1).to_mutation(v2));
+}
+
+// Checks that a schema frame naming another table than its record's does not lend that record its
+// column mapping, on a read or a copy.
+SEASTAR_THREAD_TEST_CASE(test_logstor_schema_frame_of_another_table_is_not_used) {
+    forget_column_mappings();
+    auto reset_mappings = seastar::defer([] noexcept { forget_column_mappings(); });
+    auto v1 = make_multi_column_schema();
+    auto v2 = schema_builder(v1).with_column("y", long_type).build();
+    auto m = make_multi_column_mutation(v1, "pk0", api::timestamp_type(1));
+
+    raw_write_buffer wb(16 * 1024, segment_kind::mixed);
+    wb.append(log_record_writer(make_log_record(m, encode_record_value(m))));
+    wb.seal(segment_sequence{3}, std::nullopt, ondisk::block_alignment);
+    auto chunk = copy_chunk(wb.chunk());
+    patch_first_schema_frame(chunk, ondisk::schema_version_size, table_id(utils::UUID_gen::get_time_UUID()));
+    forget_column_mappings();
+
+    const auto before = get_schema_frame_stats();
+    auto scanned = scan_buffer_records(chunk, log_segment_id{0});
+    BOOST_REQUIRE_EQUAL(scanned.size(), 1u);
+    BOOST_REQUIRE_EQUAL(get_schema_frame_stats().records_without_frame, before.records_without_frame + 1);
+    BOOST_REQUIRE(find_known_schema(v1->version()));
+    assert_that(to_mutation(scanned[0].record, v1)).is_equal_to(m);
+    BOOST_REQUIRE_EXCEPTION(to_mutation(scanned[0].record, v2), std::runtime_error,
+            [] (const std::runtime_error& e) { return std::string_view(e.what()).contains("belongs to table"); });
+    auto copied = copy_records_as_bytes(chunk);
+    BOOST_REQUIRE_EQUAL(count_schema_frames(copied), 0u);
+}
+
+// Checks that a write of a version a scan remembered from a schema frame of another table replaces
+// the entry with the live schema, in place.
+SEASTAR_THREAD_TEST_CASE(test_logstor_write_replaces_unverified_schema_entry) {
+    forget_column_mappings();
+    auto reset_mappings = seastar::defer([] noexcept { forget_column_mappings(); });
+    auto s = make_multi_column_schema();
+    auto frame_value = [] (const schema& s, table_id table) {
+        bytes_ostream out;
+        ser::serializer<int64_t>::write(out, s.version().uuid().get_most_significant_bits());
+        ser::serializer<int64_t>::write(out, s.version().uuid().get_least_significant_bits());
+        ser::serialize(out, table);
+        ser::serialize(out, s.get_column_mapping());
+        return bytes(out.linearize());
+    };
+
+    const auto other_table = table_id(utils::UUID_gen::get_time_UUID());
+    const auto* entry = remember_schema_frame(frame_value(*s, other_table));
+    BOOST_REQUIRE(entry->table == other_table);
+
+    auto m = make_multi_column_mutation(s, "pk0", api::timestamp_type(1));
+    encode_record_value(m);
+    BOOST_REQUIRE(find_known_schema(s->version()) == entry);
+    BOOST_REQUIRE(entry->table == s->id());
+    BOOST_REQUIRE(entry->mapping == s->get_column_mapping());
+    BOOST_REQUIRE(entry->verified);
+
+    // The frame the entry now carries is the one of the live schema.
+    raw_write_buffer wb(16 * 1024, segment_kind::mixed);
+    wb.append(log_record_writer(make_log_record(m, encode_record_value(m))));
+    wb.seal(segment_sequence{3}, std::nullopt, ondisk::block_alignment);
+    forget_column_mappings();
+    BOOST_REQUIRE_EQUAL(scan_buffer_records(copy_chunk(wb.chunk()), log_segment_id{0}).size(), 1u);
+    BOOST_REQUIRE(find_known_schema(s->version())->table == s->id());
+}
+
+// Checks that a buffer which wrote the frame of an unverified entry writes the frame again once a
+// write replaces the entry, rather than appending live records behind the stale frame.
+SEASTAR_THREAD_TEST_CASE(test_logstor_chunk_rewrites_schema_frame_of_replaced_entry) {
+    forget_column_mappings();
+    auto reset_mappings = seastar::defer([] noexcept { forget_column_mappings(); });
+    auto s = make_multi_column_schema();
+    auto m0 = make_multi_column_mutation(s, "pk0", api::timestamp_type(1));
+    auto m1 = make_multi_column_mutation(s, "pk1", api::timestamp_type(2));
+    auto value0 = encode_record_value(m0);
+
+    // An unverified entry of the version, as a scan leaves it, with the frame of another table.
+    forget_column_mappings();
+    bytes_ostream out;
+    ser::serializer<int64_t>::write(out, s->version().uuid().get_most_significant_bits());
+    ser::serializer<int64_t>::write(out, s->version().uuid().get_least_significant_bits());
+    ser::serialize(out, table_id(utils::UUID_gen::get_time_UUID()));
+    ser::serialize(out, s->get_column_mapping());
+    const auto* entry = remember_schema_frame(bytes(out.linearize()));
+    BOOST_REQUIRE(!entry->verified);
+    const auto stale_frame = entry->schema_frame;
+
+    raw_write_buffer wb(16 * 1024, segment_kind::mixed);
+    wb.append(log_record_writer(make_log_record(m0, std::move(value0))));
+    // This write replaces the entry in place.
+    wb.append(log_record_writer(make_log_record(m1, encode_record_value(m1))));
+    BOOST_REQUIRE(find_known_schema(s->version()) == entry);
+    BOOST_REQUIRE(entry->verified);
+    BOOST_REQUIRE(entry->schema_frame != stale_frame);
+    wb.seal(segment_sequence{3}, std::nullopt, ondisk::block_alignment);
+
+    const auto frames = list_chunk_frames(wb.chunk());
+    BOOST_REQUIRE_EQUAL(frames.size(), 4u);
+    BOOST_REQUIRE(frames[0].kind == frame_kind::schema);
+    BOOST_REQUIRE(frames[0].raw == stale_frame);
+    BOOST_REQUIRE(frames[1].kind == frame_kind::mutation);
+    BOOST_REQUIRE(frames[2].kind == frame_kind::schema);
+    BOOST_REQUIRE(frames[2].schema_version == s->version());
+    BOOST_REQUIRE(frames[2].raw == entry->schema_frame);
+    BOOST_REQUIRE(frames[3].kind == frame_kind::mutation);
+}
+
+// Checks that the separator and compaction, which copy records as bytes, write the schema frame of
+// each version they copy: after the shard forgets the versions, a scan of the group's segments (what
+// recovery does) reads every record under the latest schema. Versions change as ALTER TABLE does.
+SEASTAR_THREAD_TEST_CASE(test_logstor_separator_and_compaction_carry_schema_frames) {
+    auto v1 = make_multi_column_schema();
+    auto v2 = schema_builder(v1).with_column("y", long_type).build();
+    auto v3 = schema_builder(v2).without_column("w", api::timestamp_type(5)).build();
+    tmpdir dir;
+
+    shared_logstor_cache cache;
+    logstor ls(make_test_logstor_config(dir.path()), cache.shared_tracker);
+    ls.do_recovery_for_test().get();
+    ls.start().get();
+    auto stop_store = seastar::defer([&ls] noexcept { ls.stop().get(); });
+
+    test_logstor_group cg(v1, ls);
+    auto setup_guard = std::make_optional(ls.get_compaction_manager().disable_compaction(cg).get());
+
+    // A segment per write_and_flush_segment(): one of v1, one with versions mixed, one of v3, and
+    // overwrites, so that compaction has dead records to drop.
+    std::vector<mutation> first = {
+        make_multi_column_mutation(v1, "pk0", api::timestamp_type(1)),
+        make_multi_column_mutation(v1, "pk1", api::timestamp_type(2)),
+    };
+    std::vector<mutation> mixed = {
+        make_multi_column_mutation(v1, "pk2", api::timestamp_type(3)),
+        make_multi_column_mutation(v2, "pk3", api::timestamp_type(4)),
+        make_multi_column_mutation(v1, "pk4", api::timestamp_type(5)),
+    };
+    std::vector<mutation> last = {
+        make_multi_column_mutation(v3, "pk0", api::timestamp_type(6)),
+        make_multi_column_mutation(v2, "pk5", api::timestamp_type(7)),
+    };
+    write_and_flush_segment(ls, cg, first);
+    write_and_flush_segment(ls, cg, mixed);
+    write_and_flush_segment(ls, cg, last);
+    BOOST_REQUIRE_EQUAL(cg.logstor_segments().segment_count(), 3u);
+
+    const std::vector<mutation> live = {first[1], mixed[0], mixed[1], mixed[2], last[0], last[1]};
+
+    forget_and_rescan(ls, cg);
+    BOOST_REQUIRE_EQUAL(known_column_mapping_count(), 3u);
+    check_reads_under(ls, cg, v3, live);
+
+    setup_guard.reset();
+    ls.get_compaction_manager().submit(cg);
+    auto compaction_guard = ls.get_compaction_manager().disable_compaction(cg).get();
+    BOOST_REQUIRE_EQUAL(cg.logstor_segments().segment_count(), 1u);
+
+    forget_and_rescan(ls, cg);
+    BOOST_REQUIRE_EQUAL(known_column_mapping_count(), 3u);
+    check_reads_under(ls, cg, v3, live);
+    check_reads_under(ls, cg, v1, live);
+}
+
+namespace {
+
+// Writes values of most of a segment from another group, so that the active segment the earlier
+// writes went through is switched away from, and freed once the separator has its records.
+void rotate_active_segment(logstor& ls, test_logstor_group& filler, schema_ptr s) {
+    const auto value = sstring(ls.get_segment_manager().get_segment_size() * 5 / 8, 'x');
+    write_and_flush_segment(ls, filler, make_kv_mutation(s, "fill0", value));
+    write_and_flush_segment(ls, filler, make_kv_mutation(s, "fill1", value));
+}
+
+std::set<log_segment_id> group_segment_ids(logstor& ls, test_logstor_group& cg) {
+    auto snapshot = ls.get_segment_manager().make_snapshot(cg).get();
+    return snapshot_segment_ids(snapshot);
+}
+
+// Writes rows under v1, overwrites all of them under v2, and compacts the group until the segment
+// of the v1 rows is freed. Returns the live rows.
+std::vector<mutation> overwrite_and_compact(logstor& ls, test_logstor_group& cg, test_logstor_group& filler,
+        schema_ptr v1, schema_ptr v2, schema_ptr filler_schema) {
+    auto setup_guard = std::make_optional(ls.get_compaction_manager().disable_compaction(cg).get());
+
+    std::vector<mutation> first = {
+        make_multi_column_mutation(v1, "pk0", api::timestamp_type(1)),
+        make_multi_column_mutation(v1, "pk1", api::timestamp_type(2)),
+    };
+    write_and_flush_segment(ls, cg, first);
+    const auto v1_segments = group_segment_ids(ls, cg);
+    BOOST_REQUIRE_EQUAL(v1_segments.size(), 1u);
+
+    std::vector<mutation> live;
+    for (size_t i = 0; i < first.size(); ++i) {
+        live.push_back(make_multi_column_mutation(v2, seastar::format("pk{}", i), api::timestamp_type(3 + i)));
+    }
+    write_and_flush_segment(ls, cg, live);
+
+    rotate_active_segment(ls, filler, filler_schema);
+    BOOST_REQUIRE_EQUAL(cg.logstor_segments().segment_count(), 2u);
+
+    setup_guard.reset();
+    ls.get_compaction_manager().submit(cg);
+    auto compaction_guard = ls.get_compaction_manager().disable_compaction(cg).get();
+    BOOST_REQUIRE(!group_segment_ids(ls, cg).contains(*v1_segments.begin()));
+    return live;
+}
+
+} // anonymous namespace
+
+// Checks that once compaction frees the segment of the overwritten v1 rows, a scan of the group's
+// segments learns v2 only, and the rows read under it.
+SEASTAR_THREAD_TEST_CASE(test_logstor_rescan_skips_schema_version_of_freed_segments) {
+    auto v1 = make_multi_column_schema();
+    auto v2 = schema_builder(v1).with_column("y", long_type).build();
+    auto kv = make_kv_schema();
+    tmpdir dir;
+
+    shared_logstor_cache cache;
+    logstor ls(make_test_logstor_config(dir.path()), cache.shared_tracker);
+    ls.do_recovery_for_test().get();
+    ls.start().get();
+    auto stop_store = seastar::defer([&ls] noexcept { ls.stop().get(); });
+
+    test_logstor_group cg(v1, ls);
+    test_logstor_group filler(kv, ls);
+    auto live = overwrite_and_compact(ls, cg, filler, v1, v2, kv);
+
+    forget_and_rescan(ls, cg);
+    BOOST_REQUIRE(!find_known_schema(v1->version()));
+    BOOST_REQUIRE(find_known_schema(v2->version()));
+    check_reads_under(ls, cg, v2, live);
 }

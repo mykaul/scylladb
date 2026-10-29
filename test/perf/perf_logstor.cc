@@ -308,8 +308,8 @@
 #include "test/perf/perf.hh"
 #include "types/types.hh"
 
-// The record size report measures the column mapping a record value carries through the serializer
-// the value is written with.
+// The record size report measures the partition a record value carries through the serializer the
+// value is written with.
 #include "serializer_impl.hh"
 #include "idl/mutation.dist.hh"
 #include "idl/mutation.dist.impl.hh"
@@ -445,25 +445,18 @@ mutation make_report_mutation(schema_ptr s, const row_shape& shape) {
     return m;
 }
 
-template <typename T>
-size_t serialized_size_of(const T& v) {
-    seastar::measuring_output_stream ms;
-    ser::serialize(ms, v);
-    return ms.size();
-}
-
 // What one record is made of, all of it measured through the serializers the write path uses.
 struct record_sizes {
     size_t header_size{}; // the serialized record_header
     size_t value_size{};  // the record value, the partition as encode_record_value() encodes it
-    size_t mapping{};     // of the value, the column mapping of the schema
+    size_t schema{};      // the padded schema frame of the version, which a chunk holds once, not per record
     size_t partition{};   // of the value, the partition itself
     size_t frame_size{};  // the record frame: the frame header, the record header and the value
     size_t padding{};     // what aligning the next frame after this one costs
 
-    // What the value spends on neither the mapping nor the partition: the version of the schema
-    // the record was written under.
-    size_t value_rest() const noexcept { return value_size - mapping - partition; }
+    // What the value spends on other than the partition: the version of the schema the record was
+    // written under.
+    size_t value_rest() const noexcept { return value_size - partition; }
 };
 
 record_sizes measure_record(const schema& s, const mutation& m) {
@@ -477,10 +470,12 @@ record_sizes measure_record(const schema& s, const mutation& m) {
     bytes_ostream partition;
     mutation_partition_serializer(s, m.partition()).write(partition);
 
+    // Encoding the value makes the shard know the schema frame of its version.
+    const auto value_size = encode_record_value(m).size();
     record_sizes sizes {
         .header_size = ondisk::record_header_size(header),
-        .value_size = encode_record_value(m).size(),
-        .mapping = serialized_size_of(s.get_column_mapping()),
+        .value_size = value_size,
+        .schema = find_known_schema(s.version())->schema_frame.size(),
         .partition = partition.size(),
     };
     sizes.frame_size = ondisk::record_frame_header_size + sizes.header_size + sizes.value_size;
@@ -496,7 +491,7 @@ void print_record_size_report(const std::vector<size_t>& key_sizes, const std::v
             "key", "cols", "value", "payload",
             "header", "value", "frame", "pad",
             "overhead", "ratio",
-            "mapping", "partition", "version");
+            "schema", "partition", "version");
     for (auto columns : column_counts) {
         auto s = make_kv_schema(static_cast<unsigned>(columns));
         for (auto value_size : value_sizes) {
@@ -509,7 +504,7 @@ void print_record_size_report(const std::vector<size_t>& key_sizes, const std::v
                         sizes.header_size, sizes.value_size, sizes.frame_size, sizes.padding,
                         sizes.frame_size - payload,
                         payload ? double(sizes.frame_size) / payload : 0.0,
-                        sizes.mapping, sizes.partition, sizes.value_rest());
+                        sizes.schema, sizes.partition, sizes.value_rest());
             }
         }
     }

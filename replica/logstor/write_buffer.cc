@@ -8,6 +8,7 @@
 #include "replica/logstor/write_buffer.hh"
 
 #include <chrono>
+#include <cstring>
 
 #include <seastar/core/align.hh>
 #include <seastar/core/aligned_buffer.hh>
@@ -28,7 +29,7 @@ void log_record_writer::write_frame(ostream& out) const {
 }
 
 void log_record_bytes_writer::write_frame(ostream& out) const {
-    ondisk::write_record_frame(out, log_record_bytes_view{_header_bytes, _value_bytes});
+    ondisk::write_record_frame(out, _record_view);
 }
 
 // raw_write_buffer
@@ -50,15 +51,13 @@ void raw_write_buffer::reset() {
     _chunk_header = {};
     _record_bytes = 0;
     _record_count = 0;
+    _schema_frame_bytes = 0;
     _min_token = std::nullopt;
     _max_token = std::nullopt;
+    static thread_local uint64_t last_chunk_stamp = 0;
+    _chunk_stamp = ++last_chunk_stamp;
+    _schema_frames.clear();
     _sealed = false;
-}
-
-bool raw_write_buffer::can_fit(size_t record_size) const noexcept {
-    // The record with its frame header and the padding that follows the frame.
-    const auto frame_size = ondisk::record_frame_header_size + record_size;
-    return align_up(frame_size, ondisk::record_alignment) <= _stream.size();
 }
 
 bool raw_write_buffer::has_data() const noexcept {
@@ -74,10 +73,39 @@ raw_write_buffer::append_result raw_write_buffer::append(const Writer& writer) {
     if (header_size < ondisk::record_header_fixed_size) {
         on_internal_error(logstor_logger, fmt::format("Record header size {} is below its fixed size {}", header_size, ondisk::record_header_fixed_size));
     }
+    if (header_size - ondisk::record_header_fixed_size > ondisk::max_key_size) [[unlikely]] {
+        ondisk::throw_key_too_large(header_size - ondisk::record_header_fixed_size);
+    }
 
+    const known_schema* known = writer.schema();
+    const bytes* schema_frame = nullptr;
     const auto record_size = header_size + value_size;
-    if (!can_fit(record_size)) {
-        throw std::runtime_error(fmt::format("Record of size {} does not fit the {} bytes left in the buffer", record_size, _stream.size()));
+    size_t space = padded_frame_size(record_size);
+    if (!known) [[unlikely]] {
+        // A copy of a record whose source chunk lacked its schema frame goes without one.
+        if constexpr (!std::same_as<Writer, log_record_bytes_writer>) {
+            on_internal_error(logstor_logger, fmt::format("No column mapping for schema version {} of a record of table {}", writer.schema_version(), header.table));
+        }
+    } else if (!has_schema_frame(*known)) {
+        schema_frame = &known->schema_frame;
+        space += schema_frame->size();
+    }
+
+    if (space > _stream.size()) {
+        throw std::runtime_error(fmt::format("Record of size {} with a schema frame of {} does not fit the {} bytes left in the buffer",
+                record_size, schema_frame ? schema_frame->size() : 0, _stream.size()));
+    }
+
+    if (schema_frame) {
+        ++get_schema_frame_stats().written;
+        get_schema_frame_stats().bytes_written += schema_frame->size();
+        _schema_frame_bytes += schema_frame->size();
+        _schema_frames.push_back(known);
+        known->chunk_stamp = std::max(known->chunk_stamp, _chunk_stamp);
+        // skip() checks the bounds; a plain memcpy is cheaper than write() for a frame never this small.
+        auto* schema_out = _stream.begin();
+        _stream.skip(schema_frame->size());
+        std::memcpy(schema_out, schema_frame->data(), schema_frame->size());
     }
 
     const size_t frame_offset = serialized_size();
@@ -158,7 +186,8 @@ void raw_write_buffer::write_header(segment_sequence segment_seq, std::optional<
     ser::serialize<ondisk::chunk_header>(_header_stream, _chunk_header);
 }
 
-size_t raw_write_buffer::estimate_required_segments(size_t record_bytes, size_t record_count, size_t segment_size, segment_kind kind) {
+size_t raw_write_buffer::estimate_required_segments(size_t record_bytes, size_t record_count, size_t segment_size, segment_kind kind,
+        size_t schema_frame_bytes) {
     if (record_count == 0 || record_bytes == 0) {
         return 0;
     }
@@ -169,7 +198,9 @@ size_t raw_write_buffer::estimate_required_segments(size_t record_bytes, size_t 
         return 1;
     }
 
-    const auto usable_bytes = segment_size - fixed_overhead;
+    auto usable_bytes = segment_size - fixed_overhead;
+    // An estimate of the frames must not eat the segment.
+    usable_bytes -= std::min(schema_frame_bytes, usable_bytes / 2);
     auto records_per_segment = (usable_bytes * record_count) / record_bytes;
     if (records_per_segment == 0) {
         records_per_segment = 1;
@@ -679,14 +710,13 @@ future<buffered_write_result> buffered_writer::write_to_buffer(log_record_writer
   try {
     auto holder = _async_gate.hold();
 
-    // The record has to fit the mixed buffer it goes into here and the full segment the separator
-    // later rewrites it into, so it is bounded by whichever of the two takes less: one that only
-    // fits the buffer it is written to first would be accepted here and then never fit anywhere the
-    // separator could put it.
+    // The record has to fit both this mixed buffer and the full segment the separator rewrites it
+    // into. Its schema frame counts, as it may be the first of its version in any chunk it goes to.
     const size_t max_size = raw_write_buffer::max_record_size_any_kind(head_buf().buffer_size());
-    if (writer.record_size() > max_size) [[unlikely]] {
+    const size_t write_size = writer.record_size() + raw_write_buffer::schema_frame_space(writer.schema());
+    if (write_size > max_size) [[unlikely]] {
         return make_exception_future<buffered_write_result>(std::runtime_error(
-                fmt::format("Write size {} exceeds the maximum record size {}", writer.record_size(), max_size)));
+                fmt::format("Write size {} exceeds the maximum record size {}", write_size, max_size)));
     }
 
     // fast path - if there are no queued writes and there is space in the current head buffer or the next, advance the
