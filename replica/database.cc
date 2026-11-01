@@ -18,6 +18,7 @@
 #include "locator/token_metadata_fwd.hh"
 #include "replica/logstor/compaction.hh"
 #include "replica/logstor/logstor.hh"
+#include "replica/logstor/record_value.hh"
 #include "replica/logstor/segment_manager.hh"
 #include "replica/logstor/types.hh"
 #include "utils/log.hh"
@@ -1471,8 +1472,12 @@ future<> database::cleanup_drop_table_on_all_shards(sharded<database>& sharded_d
     const bool persist_truncation_record = false;
     auto f = co_await coroutine::as_future(truncate_table_on_all_shards(sharded_db, sys_ks, table_shards, truncated_at, with_snapshot, std::move(snapshot_name_opt),
             persist_truncation_record));
-    co_await smp::invoke_on_all([&] {
-        return table_shards->stop();
+    co_await smp::invoke_on_all([&] () -> future<> {
+        co_await table_shards->stop();
+        // Stopped: nothing writes or reads the table's records, so nothing uses its schema entries.
+        if (table_shards->uses_logstor()) {
+            logstor::forget_table_schemas(table_shards->schema()->id());
+        }
     });
     f.get(); // re-throw exception from truncate() if any
     co_await sys_ks.local().remove_truncation_records(table_shards->schema()->id());

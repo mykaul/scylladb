@@ -9,6 +9,7 @@
 #include "replica/logstor/segment_file.hh"
 #include "replica/logstor/ondisk.hh"
 #include "replica/logstor/segment_io.hh"
+#include "replica/logstor/record_value.hh"
 #include "exceptions/exceptions.hh"
 #include "replica/compaction_group.hh"
 #include "backlog_controller.hh"
@@ -22,6 +23,7 @@
 #include <array>
 #include <chrono>
 #include <system_error>
+#include <unordered_set>
 #include <seastar/core/file.hh>
 #include <seastar/core/seastar.hh>
 #include <seastar/core/fstream.hh>
@@ -595,6 +597,11 @@ struct separator_task {
     utils::phased_barrier::operation write_op;
 };
 
+// For each schema version, the segments that hold records of it. Recovery fills it, and frees it
+// once it has pruned the shard's schema map.
+using recovered_versions = std::unordered_map<table_schema_version, std::vector<log_segment_id>, schema_version_hash>;
+using schema_version_set = std::unordered_set<table_schema_version, schema_version_hash>;
+
 class segment_manager_impl {
 
     struct stats {
@@ -715,7 +722,9 @@ public:
     }
 
     future<> load_segment(replica::database&, log_segment_id);
-    future<> recover_segment(replica::database&, log_segment_id, primary_index::entry_cmp_fn cmp, std::function<void(const segment_info&)> on_segment_info);
+    // versions, if set, gets the segment added to the version of each of its records.
+    future<> recover_segment(replica::database&, log_segment_id, primary_index::entry_cmp_fn cmp, std::function<void(const segment_info&)> on_segment_info,
+            recovered_versions* versions = nullptr);
     future<> add_segment_to_compaction_group(replica::database&, segment_descriptor&);
 
     compaction_manager& get_compaction_manager() noexcept {
@@ -827,7 +836,8 @@ private:
     future<> scan_segment(log_segment_id segment_id,
                           segment_info_consumer on_segment_info,
                           record_header_consumer on_record_header,
-                          RecordConsumer on_record);
+                          RecordConsumer on_record,
+                          record_version_consumer on_record_version = {});
 
     segment_ref make_segment_ref(log_segment_id seg_id) {
         auto& desc = get_segment_descriptor(seg_id);
@@ -1586,13 +1596,14 @@ template <log_record_consumer_like RecordConsumer>
 future<> segment_manager_impl::scan_segment(log_segment_id segment_id,
                                 segment_info_consumer on_segment_info,
                                 record_header_consumer on_record_header,
-                                RecordConsumer on_record) {
+                                RecordConsumer on_record,
+                                record_version_consumer on_record_version) {
     auto in = co_await create_segment_input_stream(segment_id, seastar::file_input_stream_options {
         .buffer_size = std::max<size_t>(_cfg.segment_size, 128 * 1024),
         .read_ahead = 0,
     });
     auto scan_result = co_await coroutine::as_future(::replica::logstor::scan_segment(in, segment_id, _cfg.segment_size,
-            std::move(on_segment_info), std::move(on_record_header), std::move(on_record)));
+            std::move(on_segment_info), std::move(on_record_header), std::move(on_record), std::move(on_record_version)));
     co_await in.close();
     if (scan_result.failed()) {
         co_await coroutine::return_exception_ptr(scan_result.get_exception());
@@ -2233,6 +2244,26 @@ future<> compaction_manager_impl::flush_separator_buffer(separator_buffer& buf, 
     co_await buf.release();
 }
 
+namespace {
+
+// Erases the unverified schema entries that no live record can need: no used segment holds a
+// record of the version, or the table is gone or not on logstor.
+void prune_recovered_schemas(replica::database& db, const schema_version_set& versions_in_used_segments) {
+    const size_t pruned = forget_schemas([&] (const known_schema& k) {
+        if (k.verified) {
+            return false;
+        }
+        if (!versions_in_used_segments.contains(k.version)) {
+            return true;
+        }
+        const auto t = db.get_tables_metadata().get_table_if_exists(k.table);
+        return !t || !t->uses_logstor();
+    });
+    logstor_logger.info("Schema versions after recovery pruned {}: {} left", pruned, known_column_mapping_count());
+}
+
+} // anonymous namespace
+
 future<> segment_manager_impl::do_recovery(replica::database& db) {
     logstor_logger.info("Starting recovery for shard {} in directory {}", this_shard_id(), _cfg.base_dir.string());
 
@@ -2248,6 +2279,8 @@ future<> segment_manager_impl::do_recovery(replica::database& db) {
     // segments_in_use() does not go below zero while recovery runs. A retired file is at or above
     // the configured count, and a new segment is only below it, so retiring files changes nothing.
     _next_new_segment_id = found_segment_count;
+
+    recovered_versions recovered;
 
     std::vector<segment_sequence> segment_seqs(static_cast<size_t>(found_segment_count), segment_sequence(0));
     segment_sequence max_segment_seq = segment_sequence(0);
@@ -2269,12 +2302,12 @@ future<> segment_manager_impl::do_recovery(replica::database& db) {
     for (file_id_t file_id = 0; file_id < found_file_count; ++file_id) {
         logstor_logger.info("Recovering segments from file {}: {}%", _file_mgr.file_path(file_id).string(), (file_id + 1) * 100 / found_file_count);
         co_await max_concurrent_for_each(segments_in_file(file_id), 32,
-            [this, &db, &cmp_with_seq, &segment_seqs, &max_segment_seq] (log_segment_id seg_id) {
+            [this, &db, &cmp_with_seq, &segment_seqs, &max_segment_seq, &recovered] (log_segment_id seg_id) {
                 return recover_segment(db, seg_id, cmp_with_seq,
                     [seg_id, &segment_seqs, &max_segment_seq] (const segment_info& seg_info) {
                         segment_seqs[seg_id.value] = seg_info.segment_seq;
                         max_segment_seq = std::max(max_segment_seq, seg_info.segment_seq);
-                    });
+                    }, &recovered);
             }
         );
     }
@@ -2295,6 +2328,16 @@ future<> segment_manager_impl::do_recovery(replica::database& db) {
             co_await coroutine::maybe_yield();
         }
     });
+
+    // The versions with a record in a used segment, which is all the prune below needs.
+    schema_version_set versions_in_used_segments;
+    for (const auto& [version, segment_ids] : recovered) {
+        if (std::ranges::any_of(segment_ids, [&] (log_segment_id id) { return used_segments.test(id.value); })) {
+            versions_in_used_segments.insert(version);
+        }
+        co_await coroutine::maybe_yield();
+    }
+    recovered = {};
 
     // put used segments in compaction groups, and put the rest in the free list.
     uint64_t free_segment_count = 0;
@@ -2333,6 +2376,11 @@ future<> segment_manager_impl::do_recovery(replica::database& db) {
         }
     }
 
+    // After the separator pass, which reads frames of dropped tables too. An erased version has no
+    // record in a used segment or belongs to a missing table, so no separator buffer or live table's
+    // writer holds it.
+    prune_recovered_schemas(db, versions_in_used_segments);
+
     _next_segment_seq = max_segment_seq + 1;
 
     co_await files.finish();
@@ -2348,9 +2396,18 @@ future<> segment_manager_impl::do_recovery_for_test() {
 }
 
 future<> segment_manager_impl::recover_segment(replica::database& db, log_segment_id segment_id,
-        primary_index::entry_cmp_fn cmp, std::function<void(const segment_info&)> on_segment_info) {
+        primary_index::entry_cmp_fn cmp, std::function<void(const segment_info&)> on_segment_info, recovered_versions* versions) {
     auto& desc = get_segment_descriptor(segment_id);
     desc.reset(_cfg.segment_size);
+
+    // The scan reports a version once per chunk; the segment is added once per version.
+    schema_version_set segment_versions;
+    record_version_consumer on_record_version;
+    if (versions) {
+        on_record_version = [&] (table_schema_version v) {
+            segment_versions.insert(v);
+        };
+    }
 
     co_await scan_segment(segment_id,
         [segment_id, on_segment_info = std::move(on_segment_info)] (const segment_info& seg_info) mutable {
@@ -2381,7 +2438,12 @@ future<> segment_manager_impl::recover_segment(replica::database& db, log_segmen
         [] (record_location, log_record) {
             // we don't read record data, only headers.
             return make_ready_future<>();
-        });
+        },
+        std::move(on_record_version));
+
+    for (const auto& v : segment_versions) {
+        (*versions)[v].push_back(segment_id);
+    }
 }
 
 void segment_manager::on_add_record(record_location location) noexcept {

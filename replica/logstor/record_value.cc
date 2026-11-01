@@ -8,6 +8,7 @@
 
 #include "replica/logstor/record_value.hh"
 
+#include <functional>
 #include <optional>
 #include <unordered_map>
 #include <vector>
@@ -88,13 +89,6 @@ public:
     }
 };
 
-// std::hash<utils::UUID> xors the halves, so time-UUIDs made in a row share buckets.
-struct schema_version_hash {
-    size_t operator()(table_schema_version v) const noexcept {
-        return absl::HashOf(v.uuid().get_most_significant_bits(), v.uuid().get_least_significant_bits());
-    }
-};
-
 // Not absl::flat_hash_map: release builds keep its debug checks, which cost on every lookup.
 // Node based, so entries keep their address.
 using known_schema_map = std::unordered_map<table_schema_version, known_schema, schema_version_hash>;
@@ -102,6 +96,12 @@ using known_schema_map = std::unordered_map<table_schema_version, known_schema, 
 known_schema_map& known_schemas() noexcept {
     static thread_local known_schema_map schemas;
     return schemas;
+}
+
+// Counts the erasures of entries, so a scan that was suspended can tell its pointers may be stale.
+uint64_t& erase_count() noexcept {
+    static thread_local uint64_t count = 0;
+    return count;
 }
 
 // The schema frame of a value, padded, so that an append copies it as is.
@@ -194,6 +194,10 @@ std::optional<api::timestamp_type> marker_timestamp(
 }
 
 } // anonymous namespace
+
+size_t schema_version_hash::operator()(table_schema_version v) const noexcept {
+    return absl::HashOf(v.uuid().get_most_significant_bits(), v.uuid().get_least_significant_bits());
+}
 
 api::timestamp_type record_timestamp(const mutation& m) {
     const auto& partition = m.partition();
@@ -316,9 +320,26 @@ const known_schema* find_known_schema(table_schema_version v) noexcept {
     return it != schemas.end() ? &it->second : nullptr;
 }
 
+size_t forget_schemas(const std::function<bool(const known_schema&)>& erase) {
+    const auto erased = std::erase_if(known_schemas(), [&erase] (const auto& e) {
+        return erase(e.second);
+    });
+    last_remembered() = nullptr;
+    erase_count() += erased;
+    return erased;
+}
+
+void forget_table_schemas(table_id table) {
+    forget_schemas([table] (const known_schema& k) { return k.table == table; });
+}
+
 schema_frame_stats& get_schema_frame_stats() noexcept {
     static thread_local schema_frame_stats stats;
     return stats;
+}
+
+uint64_t known_schemas_erased() noexcept {
+    return erase_count();
 }
 
 size_t known_column_mapping_count() noexcept {
@@ -331,6 +352,7 @@ void forget_column_mappings() {
     retired.push_back(std::move(known_schemas()));
     known_schemas().clear();
     last_remembered() = nullptr;
+    ++erase_count();
 }
 
 } // namespace replica::logstor

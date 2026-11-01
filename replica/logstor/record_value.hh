@@ -7,6 +7,9 @@
  */
 #pragma once
 
+#include <functional>
+#include <vector>
+
 #include "replica/logstor/types.hh"
 #include "schema/schema.hh"
 
@@ -45,9 +48,14 @@ single_row_partition decode_record_value(const record_value& v, const schema& s,
 table_schema_version record_schema_version(const record_value& v);
 table_schema_version record_schema_version(bytes_view value);
 
+// std::hash<utils::UUID> xors the halves, so time-UUIDs made in a row share buckets.
+struct schema_version_hash {
+    size_t operator()(table_schema_version v) const noexcept;
+};
+
 // Per-shard map of schema version to column mapping, so reads never look for a schema frame.
-// Filled by encode_record_value() and by segment scans of schema frames. Never pruned: a restart
-// rebuilds it from the schema frames on disk.
+// Filled by encode_record_value() and by segment scans of schema frames. Pruned at recovery and on
+// DROP TABLE; otherwise an entry stays until restart, which rebuilds the map from the frames on disk.
 struct known_schema {
     table_schema_version version;
     table_id table;
@@ -70,6 +78,13 @@ const known_schema* remember_schema_frame(bytes_view value);
 // The entry of the version, or nullptr if the shard does not know it.
 const known_schema* find_known_schema(table_schema_version v) noexcept;
 
+// Erases the entries for which erase() returns true, and returns how many it erased. A caller that
+// prunes entries the writes of this shard use must keep the verified ones.
+size_t forget_schemas(const std::function<bool(const known_schema&)>& erase);
+
+// Erases the entries of the table. For a table that is stopped: nothing writes or reads it.
+void forget_table_schemas(table_id table);
+
 // Per-shard counts of schema frames, for metrics and for tests to check what they wrote.
 struct schema_frame_stats {
     // Appended to a chunk.
@@ -82,6 +97,10 @@ struct schema_frame_stats {
     uint64_t records_without_frame = 0;
 };
 schema_frame_stats& get_schema_frame_stats() noexcept;
+
+// How many times entries were erased, by forget_schemas() or forget_column_mappings(). A caller
+// that keeps a known_schema pointer across a suspension looks the entry up again if this changed.
+uint64_t known_schemas_erased() noexcept;
 
 // For tests. forget_column_mappings() keeps the entries alive, as buffers may still point to them.
 size_t known_column_mapping_count() noexcept;

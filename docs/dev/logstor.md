@@ -237,16 +237,19 @@ record_value         (value_size bytes)
 zero_padding         -- to align to record_alignment (8 bytes)
 ```
 
-A chunk also holds one schema frame per schema version its records were written under, ahead of
-the first record of that version. A schema frame is a frame of `frame_kind::schema` with no record
+A chunk also holds one schema frame per schema version its records were written under, ahead of the
+first record of that version. A schema frame is a frame of `frame_kind::schema` with no record
 header and a `key_size` of zero; its value is the schema version, the id of the table the version
-belongs to, and the IDL-serialized `column_mapping` of that version. `raw_write_buffer::append()` inserts it, on every path that
-builds a chunk. Only the chunk scan reads it, into a per-shard map of version to column mapping;
-a record read never looks for it, and it is never indexed. The map is not pruned while the shard
-runs. A restart rebuilds it from the schema frames on disk, so it holds the versions with frames
-in the segments recovery scans (the live ones, and freed ones not yet reused) plus the versions
-written since the start. What the shard adds while running is bounded by roughly the number of
-`ALTER TABLE`s since the start times the size of an entry.
+belongs to, and the IDL-serialized `column_mapping` of that version. `raw_write_buffer::append()`
+inserts it, on every path that builds a chunk. Only the chunk scan reads it, into a per-shard map of
+version to column mapping; a record read never looks for it, and it is never indexed. A restart
+rebuilds the map from the schema frames on disk. Recovery scans the freed segments too, so it then
+prunes the entries of the versions that no segment with live data has a record of, and the entries
+of tables that are gone or not on logstor. It does so once, after its separator pass, which reads
+the frames of used mixed segments, dropped tables' included. A DROP TABLE, and so a DROP KEYSPACE,
+erases the entries of the table once it is stopped. Otherwise an entry stays until the next restart:
+the map holds one entry per version that the shard wrote or scanned, so while the shard runs it
+grows by about the number of `ALTER TABLE`s times the size of an entry.
 
 ```
 record_frame_header  (8 bytes; key_size 0, kind schema)

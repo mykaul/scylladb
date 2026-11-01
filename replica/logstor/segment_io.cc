@@ -187,9 +187,13 @@ future<> scan_chunk_records(simple_memory_input_stream records,
         size_t records_position,
         log_segment_id segment_id,
         const record_header_consumer& on_record_header,
-        const log_record_bytes_consumer& on_record) {
+        const log_record_bytes_consumer& on_record,
+        const record_version_consumer& on_record_version) {
     const size_t records_size = records.size();
     utils::small_vector<const known_schema*, 2> chunk_schemas;
+    // The versions of chunk_schemas, to look the entries up again: on_record can erase them.
+    utils::small_vector<table_schema_version, 2> chunk_versions;
+    utils::small_vector<table_schema_version, 2> reported_versions;
     size_t bad_schema_frames = 0;
     size_t records_without_schema_frame = 0;
     while (records.size() > 0) {
@@ -205,7 +209,9 @@ future<> scan_chunk_records(simple_memory_input_stream records,
                 utils::get_local_injector().inject("logstor_skip_schema_frames", [] {
                     throw std::runtime_error("schema frame skipped by injection");
                 });
-                chunk_schemas.push_back(remember_schema_frame(frame->value));
+                const auto* k = remember_schema_frame(frame->value);
+                chunk_versions.push_back(k->version);
+                chunk_schemas.push_back(k);
             } catch (...) {
                 if (!bad_schema_frames++) {
                     logstor_logger.warn("Skipped a schema frame at offset {} of {}: {}", record_offset, segment_id, std::current_exception());
@@ -230,6 +236,10 @@ future<> scan_chunk_records(simple_memory_input_stream records,
             // Checked for every record, so that every scan verifies I1. A copy of the record writes
             // the schema frame found here; the map is only a fallback for a chunk that lacks it.
             const auto v = record_schema_version(frame->value);
+            if (on_record_version && !std::ranges::contains(reported_versions, v)) {
+                reported_versions.push_back(v);
+                on_record_version(v);
+            }
             auto it = std::ranges::find(chunk_schemas, v, &known_schema::version);
             const known_schema* known = it != chunk_schemas.end() ? *it : find_known_schema(v);
             if (it == chunk_schemas.end() || !known || known->table != header.table) [[unlikely]] {
@@ -239,7 +249,20 @@ future<> scan_chunk_records(simple_memory_input_stream records,
             bytes.schema = known;
 
             if (on_record_header(loc, header) == want_data::yes) {
+                const auto erased_before = known_schemas_erased();
                 co_await on_record(loc, header, bytes);
+                if (known_schemas_erased() != erased_before) [[unlikely]] {
+                    // The pointers may dangle. A version that is gone counts as a record without its frame.
+                    chunk_schemas.clear();
+                    size_t kept = 0;
+                    for (const auto cv : chunk_versions) {
+                        if (const auto* k = find_known_schema(cv)) {
+                            chunk_versions[kept++] = cv;
+                            chunk_schemas.push_back(k);
+                        }
+                    }
+                    chunk_versions.erase(chunk_versions.begin() + kept, chunk_versions.end());
+                }
             }
         }
 
@@ -272,7 +295,8 @@ future<> scan_segment(seastar::input_stream<char>& in,
         size_t segment_size,
         segment_info_consumer on_segment_info,
         record_header_consumer on_record_header,
-        log_record_bytes_consumer on_record) {
+        log_record_bytes_consumer on_record,
+        record_version_consumer on_record_version) {
     segment_reader reader(in);
     std::optional<segment_sequence> segment_seq;
     // The number of chunks whose body does not match its CRC, and whether the last chunk of the scan
@@ -314,7 +338,7 @@ future<> scan_segment(seastar::input_stream<char>& in,
         if (ondisk::validate_chunk_body(ch, std::span(body_buf->get(), body_buf->size()))) {
             last_chunk_failed = false;
             auto records = simple_memory_input_stream(body_buf->get(), body_buf->size());
-            co_await scan_chunk_records(records, reader.position() - records.size(), segment_id, on_record_header, on_record);
+            co_await scan_chunk_records(records, reader.position() - records.size(), segment_id, on_record_header, on_record, on_record_version);
         } else {
             // The valid header gives the size of the chunk, so the scan continues at the next
             // chunk. After a torn chunk, what follows is not a valid chunk or is a chunk of an
@@ -348,12 +372,13 @@ future<> scan_segment(seastar::input_stream<char>& in,
         size_t segment_size,
         segment_info_consumer on_segment_info,
         record_header_consumer on_record_header,
-        log_record_consumer on_record) {
+        log_record_consumer on_record,
+        record_version_consumer on_record_version) {
     co_await scan_segment(in, segment_id, segment_size,
             std::move(on_segment_info), std::move(on_record_header),
             [on_record = std::move(on_record)] (record_location loc, const record_header& header, log_record_bytes_view record_view) {
                 return on_record(loc, log_record{header, record_value(record_view.value)});
-            });
+            }, std::move(on_record_version));
 }
 
 streamed_segment_rewriter::streamed_segment_rewriter(log_segment_id target_segment, segment_sequence target_seq, streamed_buffer_consumer on_buffer)

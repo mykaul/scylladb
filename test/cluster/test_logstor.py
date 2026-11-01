@@ -1522,6 +1522,144 @@ async def test_alter_table_and_restart(manager: ScyllaClusterManager):
         assert metrics.get("scylla_logstor_sm_records_without_schema_frame") == 0
         assert metrics.get("scylla_logstor_sm_known_schema_versions") >= 3
 
+async def get_known_schema_versions(manager: ScyllaClusterManager, server) -> int:
+    metrics = await manager.metrics.query(server.ip_addr)
+    return metrics.get("scylla_logstor_sm_known_schema_versions")
+
+async def test_recovery_prunes_schema_versions_without_live_records(manager: ScyllaClusterManager):
+    """
+    Test that recovery keeps the schema version of a record that is still live, and forgets one
+    that only dead records, in segments that are free, were written under. Their schema frames
+    are still on disk, and a scan reads them.
+    """
+    cmdline = ['--logger-log-level', 'logstor=debug', '--smp=1']
+    cfg = {'experimental_features': ['logstor']}
+    servers = await manager.servers_add(1, cmdline=cmdline, config=cfg)
+    server = servers[0]
+    cql = manager.get_cql()
+
+    async with new_test_keyspace(manager, "WITH tablets={'initial':1}") as ks:
+        await cql.run_async(f"CREATE TABLE {ks}.test (pk int PRIMARY KEY, a int) WITH storage_engine = 'logstor'")
+
+        expected = {}
+        for pk in range(10):
+            await cql.run_async(f"INSERT INTO {ks}.test (pk, a) VALUES ({pk}, {pk})")
+            expected[pk] = {'a': pk, 'c': None}
+        await manager.api.logstor_flush(server.ip_addr)
+
+        await cql.run_async(f"ALTER TABLE {ks}.test ADD c int")
+        for pk in range(5):
+            await cql.run_async(f"INSERT INTO {ks}.test (pk, a, c) VALUES ({pk}, {pk}, {pk})")
+            expected[pk] = {'a': pk, 'c': pk}
+        await manager.api.logstor_flush(server.ip_addr)
+        assert await get_known_schema_versions(manager, server) == 2
+
+        async def check():
+            rows = await cql.run_async(f"SELECT pk, a, c FROM {ks}.test")
+            assert {r.pk: {'a': r.a, 'c': r.c} for r in rows} == expected
+
+        async def restart():
+            nonlocal cql
+            await manager.server_stop_gracefully(server.server_id)
+            await manager.server_start(server.server_id)
+            cql, _ = await manager.get_ready_cql(servers)
+
+        # The rows 5..9 are still live under the first version.
+        await restart()
+        await check()
+        assert await get_known_schema_versions(manager, server) == 2
+
+        # Overwrites all rows, as a segment that has a live row can still have dead rows of the first
+        # version, which keep it.
+        for pk in range(10):
+            await cql.run_async(f"INSERT INTO {ks}.test (pk, a, c) VALUES ({pk}, {pk}, {pk})")
+            expected[pk] = {'a': pk, 'c': pk}
+        await manager.api.logstor_flush(server.ip_addr)
+        assert await get_known_schema_versions(manager, server) == 2
+
+        # No segment with a live row has a record of the first version now.
+        await restart()
+        await check()
+        assert await get_known_schema_versions(manager, server) == 1
+
+async def test_drop_table_forgets_schema_versions(manager: ScyllaClusterManager):
+    """
+    Test that DROP TABLE forgets the schema versions of the table, and that they do not come back
+    when the node restarts, although the table's schema frames may still be on disk.
+    """
+    cmdline = ['--logger-log-level', 'logstor=debug', '--smp=1']
+    cfg = {'experimental_features': ['logstor']}
+    servers = await manager.servers_add(1, cmdline=cmdline, config=cfg)
+    server = servers[0]
+    cql = manager.get_cql()
+
+    async with new_test_keyspace(manager, "WITH tablets={'initial':1}") as ks:
+        await cql.run_async(f"CREATE TABLE {ks}.kept (pk int PRIMARY KEY, a int) WITH storage_engine = 'logstor'")
+        await cql.run_async(f"CREATE TABLE {ks}.dropped (pk int PRIMARY KEY, a int) WITH storage_engine = 'logstor'")
+
+        for pk in range(5):
+            await cql.run_async(f"INSERT INTO {ks}.kept (pk, a) VALUES ({pk}, {pk})")
+        altered_versions = 4
+        for i in range(altered_versions):
+            if i > 0:
+                await cql.run_async(f"ALTER TABLE {ks}.dropped ADD c{i} int")
+            for pk in range(5):
+                await cql.run_async(f"INSERT INTO {ks}.dropped (pk, a) VALUES ({pk}, {pk})")
+        await manager.api.logstor_flush(server.ip_addr)
+
+        before = await get_known_schema_versions(manager, server)
+        assert before == 1 + altered_versions
+
+        await cql.run_async(f"DROP TABLE {ks}.dropped")
+        assert await get_known_schema_versions(manager, server) == before - altered_versions
+
+        await manager.server_stop_gracefully(server.server_id)
+        await manager.server_start(server.server_id)
+        cql, _ = await manager.get_ready_cql(servers)
+        assert await get_known_schema_versions(manager, server) == 1
+        rows = await cql.run_async(f"SELECT pk, a FROM {ks}.kept")
+        assert {r.pk: r.a for r in rows} == {pk: pk for pk in range(5)}
+
+async def test_recovery_forgets_schema_versions_of_dropped_table_in_mixed_segment(manager: ScyllaClusterManager):
+    """
+    Test that recovery forgets the schema versions of a dropped table whose records are in a used
+    mixed segment, which its separator pass reads again together with the records of another table.
+    """
+    cmdline = ['--logger-log-level', 'logstor=debug', '--smp=1']
+    cfg = {'experimental_features': ['logstor']}
+    servers = await manager.servers_add(1, cmdline=cmdline, config=cfg)
+    server = servers[0]
+    cql = manager.get_cql()
+
+    async with new_test_keyspace(manager, "WITH tablets={'initial':1}") as ks:
+        await cql.run_async(f"CREATE TABLE {ks}.kept (pk int PRIMARY KEY, a int) WITH storage_engine = 'logstor'")
+        await cql.run_async(f"CREATE TABLE {ks}.dropped (pk int PRIMARY KEY, a int) WITH storage_engine = 'logstor'")
+
+        altered_versions = 4
+        for i in range(altered_versions):
+            if i > 0:
+                await cql.run_async(f"ALTER TABLE {ks}.dropped ADD c{i} int")
+            for pk in range(5):
+                await cql.run_async(f"INSERT INTO {ks}.dropped (pk, a) VALUES ({pk}, {pk})")
+                await cql.run_async(f"INSERT INTO {ks}.kept (pk, a) VALUES ({pk}, {pk})")
+        assert await get_known_schema_versions(manager, server) == 1 + altered_versions
+
+        await cql.run_async(f"DROP TABLE {ks}.dropped")
+        assert await get_known_schema_versions(manager, server) == 1
+
+        # Not gracefully, which would flush the separator and leave no mixed segment with live rows.
+        await manager.server_stop(server.server_id, convict=False)
+        log = await manager.server_open_log(server.server_id)
+        mark = await log.mark()
+        await manager.server_start(server.server_id)
+        cql, _ = await manager.get_ready_cql(servers)
+
+        # Recovery read the segment with the records of both tables, as a mixed one.
+        assert await log.grep("Recovering mixed segment .* using separator", from_mark=mark)
+        rows = await cql.run_async(f"SELECT pk, a FROM {ks}.kept")
+        assert {r.pk: r.a for r in rows} == {pk: pk for pk in range(5)}
+        assert await get_known_schema_versions(manager, server) == 1
+
 @pytest.mark.skip_mode(mode='release', reason='error injections are not supported in release mode')
 async def test_recovery_without_schema_frames(manager: ScyllaClusterManager):
     """

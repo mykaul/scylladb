@@ -43,6 +43,9 @@ using log_record_consumer = std::function<future<>(record_location, log_record)>
 // The same, with the record's header and value as views into the buffer's bytes, for a consumer
 // that copies them rather than decoding them.
 using log_record_bytes_consumer = std::function<future<>(record_location, const record_header&, log_record_bytes_view)>;
+// Called once per chunk for each schema version of the chunk's records, whether or not the chunk
+// has the frame of the version.
+using record_version_consumer = std::function<void(table_schema_version)>;
 using segment_info_consumer = std::function<future<>(const segment_info&)>;
 using streamed_buffer_consumer = std::function<future<>(bytes_view)>;
 
@@ -70,12 +73,14 @@ future<std::optional<segment_info>> read_segment_info(seastar::input_stream<char
 // and no records, and the scan continues at the next chunk. The scan also stops after the only
 // chunk of a full segment. A frame that does not parse, in a chunk whose body CRC matches, fails the
 // scan; a schema frame that cannot be read is skipped, and the records after it are still indexed.
+// on_record_version, if set, gets the versions of the records of each chunk.
 future<> scan_segment(seastar::input_stream<char>& in,
         log_segment_id segment_id,
         size_t segment_size,
         segment_info_consumer on_segment_info,
         record_header_consumer on_record_header,
-        log_record_bytes_consumer on_record);
+        log_record_bytes_consumer on_record,
+        record_version_consumer on_record_version = {});
 
 // The same, with each record given to on_record as a log_record.
 future<> scan_segment(seastar::input_stream<char>& in,
@@ -83,7 +88,8 @@ future<> scan_segment(seastar::input_stream<char>& in,
         size_t segment_size,
         segment_info_consumer on_segment_info,
         record_header_consumer on_record_header,
-        log_record_consumer on_record);
+        log_record_consumer on_record,
+        record_version_consumer on_record_version = {});
 
 // Rewrites the initial streamed logstor chunk header to the local segment sequence and
 // forwards subsequent bytes unchanged. This preserves the current branch's streaming

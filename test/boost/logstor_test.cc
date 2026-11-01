@@ -26,6 +26,7 @@
 #include <seastar/util/memory-data-source.hh>
 #include <seastar/core/on_internal_error.hh>
 #include <seastar/util/defer.hh>
+#include <seastar/util/later.hh>
 
 #include "mutation/canonical_mutation.hh"
 #include "mutation/mutation_partition_serializer.hh"
@@ -4607,6 +4608,127 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_chunk_has_one_schema_frame_when_version_is
     BOOST_REQUIRE_EQUAL(frames1.size(), 2u);
     BOOST_REQUIRE(frames1[0].kind == frame_kind::schema);
     BOOST_REQUIRE(frames1[1].kind == frame_kind::mutation);
+}
+
+// Checks that a buffer finds the schema frame it holds after the version's entry was erased and
+// made again: the buffer tells frames by version, not by the address of an entry.
+SEASTAR_THREAD_TEST_CASE(test_logstor_chunk_finds_schema_frame_after_entry_is_replaced) {
+    forget_column_mappings();
+    auto reset_mappings = seastar::defer([] noexcept { forget_column_mappings(); });
+    auto s = make_multi_column_schema();
+    raw_write_buffer wb0(64 * 1024, segment_kind::mixed);
+    raw_write_buffer wb1(64 * 1024, segment_kind::mixed);
+
+    auto append = [&] (raw_write_buffer& wb, sstring pk) {
+        auto m = make_multi_column_mutation(s, pk, api::timestamp_type(1));
+        wb.append(log_record_writer(make_log_record(m, encode_record_value(m))));
+    };
+    append(wb0, "pk0");
+    forget_table_schemas(s->id());
+    // The new entry gets the stamp of a chunk newer than wb0's, so wb0 has to look for the frame.
+    append(wb1, "pk1");
+    append(wb0, "pk2");
+    wb0.seal(segment_sequence{3}, std::nullopt, ondisk::block_alignment);
+
+    const auto frames = list_chunk_frames(wb0.chunk());
+    BOOST_REQUIRE_EQUAL(frames.size(), 3u);
+    BOOST_REQUIRE(frames[0].kind == frame_kind::schema);
+    BOOST_REQUIRE(frames[1].kind == frame_kind::mutation);
+    BOOST_REQUIRE(frames[2].kind == frame_kind::mutation);
+}
+
+// Checks that forget_table_schemas() erases the entries of one table, and no others.
+SEASTAR_THREAD_TEST_CASE(test_logstor_forget_table_schemas_erases_only_that_table) {
+    forget_column_mappings();
+    auto reset_mappings = seastar::defer([] noexcept { forget_column_mappings(); });
+    auto a1 = make_multi_column_schema();
+    auto a2 = schema_builder(a1).with_version(table_schema_version(utils::UUID_gen::get_time_UUID())).build();
+    auto b = schema_builder(2, "ks", "cf_other")
+            .with_column("pk", utf8_type, column_kind::partition_key)
+            .with_column("v", utf8_type)
+            .with_column("w", int32_type)
+            .with_column("x", bytes_type)
+            .build();
+    BOOST_REQUIRE(a1->id() != b->id());
+
+    // The entry that was remembered last is a1's, the one the shard's cache points to.
+    for (auto s : {b, a2, a1}) {
+        encode_record_value(make_multi_column_mutation(s, "pk", api::timestamp_type(1)));
+    }
+    BOOST_REQUIRE_EQUAL(known_column_mapping_count(), 3u);
+
+    forget_table_schemas(a1->id());
+    BOOST_REQUIRE_EQUAL(known_column_mapping_count(), 1u);
+    BOOST_REQUIRE(!find_known_schema(a1->version()));
+    BOOST_REQUIRE(!find_known_schema(a2->version()));
+    BOOST_REQUIRE(find_known_schema(b->version()));
+
+    // A table the shard does not know changes nothing.
+    forget_table_schemas(a1->id());
+    BOOST_REQUIRE_EQUAL(known_column_mapping_count(), 1u);
+}
+
+// Checks that forget_schemas() erases the entries that the predicate selects, and that the entries
+// of schema frames are the unverified ones.
+SEASTAR_THREAD_TEST_CASE(test_logstor_forget_schemas_erases_the_selected_entries) {
+    forget_column_mappings();
+    auto reset_mappings = seastar::defer([] noexcept { forget_column_mappings(); });
+    auto written = make_multi_column_schema();
+    auto scanned = schema_builder(written).with_version(table_schema_version(utils::UUID_gen::get_time_UUID())).build();
+    encode_record_value(make_multi_column_mutation(written, "pk", api::timestamp_type(1)));
+
+    bytes_ostream out;
+    ser::serializer<int64_t>::write(out, scanned->version().uuid().get_most_significant_bits());
+    ser::serializer<int64_t>::write(out, scanned->version().uuid().get_least_significant_bits());
+    ser::serialize(out, scanned->id());
+    ser::serialize(out, scanned->get_column_mapping());
+    remember_schema_frame(out.linearize());
+    BOOST_REQUIRE_EQUAL(known_column_mapping_count(), 2u);
+    BOOST_REQUIRE(find_known_schema(written->version())->verified);
+    BOOST_REQUIRE(!find_known_schema(scanned->version())->verified);
+
+    BOOST_REQUIRE_EQUAL(forget_schemas([] (const known_schema&) { return false; }), 0u);
+    BOOST_REQUIRE_EQUAL(forget_schemas([] (const known_schema& k) { return !k.verified; }), 1u);
+    BOOST_REQUIRE(find_known_schema(written->version()));
+    BOOST_REQUIRE(!find_known_schema(scanned->version()));
+}
+
+// Checks that a scan which on_record suspends, while the entry of the chunk's schema frame is
+// erased, goes on: the later records of the version are read without their schema frame.
+SEASTAR_THREAD_TEST_CASE(test_logstor_scan_survives_erase_of_schema_entry_during_on_record) {
+    forget_column_mappings();
+    auto reset_mappings = seastar::defer([] noexcept { forget_column_mappings(); });
+    auto s = make_multi_column_schema();
+    raw_write_buffer wb(64 * 1024, segment_kind::mixed);
+    for (auto pk : {"pk0", "pk1", "pk2"}) {
+        auto m = make_multi_column_mutation(s, pk, api::timestamp_type(1));
+        wb.append(log_record_writer(make_log_record(m, encode_record_value(m))));
+    }
+    wb.seal(segment_sequence{3}, std::nullopt, ondisk::block_alignment);
+
+    auto chunk = copy_chunk(wb.chunk());
+    const auto chunk_size = chunk.size();
+    auto in = seastar::util::as_input_stream(std::move(chunk));
+    auto close_in = seastar::defer([&in] noexcept { in.close().get(); });
+
+    std::vector<bool> had_schema;
+    scan_segment(in, log_segment_id{3}, chunk_size,
+        [] (const segment_info&) {
+            return make_ready_future<>();
+        },
+        [] (record_location, const record_header&) {
+            return want_data::yes;
+        },
+        [&] (record_location, const record_header&, log_record_bytes_view record) {
+            had_schema.push_back(record.schema != nullptr);
+            if (had_schema.size() == 1) {
+                BOOST_REQUIRE_EQUAL(forget_schemas([] (const known_schema&) { return true; }), 1u);
+                return seastar::yield();
+            }
+            return make_ready_future<>();
+        }).get();
+
+    BOOST_REQUIRE((had_schema == std::vector<bool>{true, false, false}));
 }
 
 // Checks that a buffer reports the bytes of the schema frames it appended, one frame per version,

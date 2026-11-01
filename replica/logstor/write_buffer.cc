@@ -100,7 +100,7 @@ raw_write_buffer::append_result raw_write_buffer::append(const Writer& writer) {
         ++get_schema_frame_stats().written;
         get_schema_frame_stats().bytes_written += schema_frame->size();
         _schema_frame_bytes += schema_frame->size();
-        _schema_frames.push_back(known);
+        _schema_frames.push_back(known->version);
         known->chunk_stamp = std::max(known->chunk_stamp, _chunk_stamp);
         // skip() checks the bounds; a plain memcpy is cheaper than write() for a frame never this small.
         auto* schema_out = _stream.begin();

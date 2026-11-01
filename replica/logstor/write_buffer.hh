@@ -178,8 +178,8 @@ private:
     size_t _schema_frame_bytes{0};
     // Unique per chunk, and larger for a later chunk; see known_schema::chunk_stamp.
     uint64_t _chunk_stamp{0};
-    // The entries of the schema frames the chunk holds.
-    utils::small_vector<const known_schema*, 1> _schema_frames;
+    // The versions of the schema frames the chunk holds. By version, as entries can be erased.
+    utils::small_vector<table_schema_version, 1> _schema_frames;
     std::optional<dht::token> _min_token;
     std::optional<dht::token> _max_token;
 
@@ -296,7 +296,7 @@ private:
         if (k.chunk_stamp <= _chunk_stamp) [[likely]] {
             return k.chunk_stamp == _chunk_stamp;
         }
-        return std::ranges::contains(_schema_frames, &k);
+        return std::ranges::contains(_schema_frames, k.version);
     }
 
     // table is set for segment_kind::full
