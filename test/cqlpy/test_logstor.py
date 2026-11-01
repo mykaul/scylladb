@@ -12,7 +12,7 @@ import json
 import pytest
 from cassandra.protocol import ConfigurationException
 from cassandra.query import SimpleStatement
-from .util import new_test_table
+from .util import new_test_table, new_type
 
 # All tests in this file are Scylla-only (logstor is not available on Cassandra).
 @pytest.fixture(scope="module", autouse=True)
@@ -399,3 +399,77 @@ def test_logstor_large_values(cql, test_keyspace):
             row = cql.execute(f"SELECT pk, v FROM {table} WHERE pk = {i}").one()
             assert row.pk == i
             assert row.v == f"{i}-{large_value}"
+
+# Test that rows written under each schema version of a table read back under the current one,
+# as ALTER TABLE and ALTER TYPE change it: a record carries only its schema version, and the
+# column mapping of an older version comes from the schema frames logstor keeps.
+def test_logstor_alter_table(cql, test_keyspace):
+    with new_type(cql, test_keyspace, "(x int)") as udt, \
+         new_test_table(cql, test_keyspace, f"pk int PRIMARY KEY, a int, b text, s set<text>, m frozen<map<text, int>>, u frozen<{udt}>",
+                        " WITH storage_engine = 'logstor'") as table:
+        expected = {}
+        def check():
+            rows = cql.execute(f"SELECT * FROM {table}")
+            assert {r.pk: r._asdict() for r in rows} == expected
+            for pk, row in expected.items():
+                assert cql.execute(f"SELECT * FROM {table} WHERE pk = {pk}").one()._asdict() == row
+
+        for pk in range(3):
+            cql.execute(f"INSERT INTO {table} (pk, a, b, s, m, u) VALUES ({pk}, {pk}, 'b{pk}', {{'s{pk}'}}, {{'k': {pk}}}, {{x: {pk}}})")
+            expected[pk] = {'pk': pk, 'a': pk, 'b': f'b{pk}', 's': {f's{pk}'}, 'm': {'k': pk}, 'u': cql.execute(f"SELECT u FROM {table} WHERE pk = {pk}").one().u}
+        check()
+
+        cql.execute(f"ALTER TABLE {table} ADD c bigint")
+        for row in expected.values():
+            row['c'] = None
+        cql.execute(f"INSERT INTO {table} (pk, a, c) VALUES (3, 3, 30)")
+        expected[3] = {'pk': 3, 'a': 3, 'b': None, 's': None, 'm': None, 'u': None, 'c': 30}
+        check()
+
+        # A UDT field added: the old values decode with the new field null.
+        cql.execute(f"ALTER TYPE {udt} ADD y text")
+        cql.execute(f"INSERT INTO {table} (pk, u) VALUES (4, {{x: 4, y: 'y4'}})")
+        expected[4] = {'pk': 4, 'a': None, 'b': None, 's': None, 'm': None, 'u': cql.execute(f"SELECT u FROM {table} WHERE pk = 4").one().u, 'c': None}
+        assert expected[4]['u'].y == 'y4'
+        for pk in range(3):
+            expected[pk]['u'] = cql.execute(f"SELECT u FROM {table} WHERE pk = {pk}").one().u
+            assert expected[pk]['u'].x == pk and expected[pk]['u'].y is None
+        check()
+
+        # A column dropped, then added back: values written before the drop stay gone.
+        cql.execute(f"ALTER TABLE {table} DROP b")
+        for row in expected.values():
+            del row['b']
+        check()
+        cql.execute(f"ALTER TABLE {table} ADD b text")
+        for row in expected.values():
+            row['b'] = None
+        cql.execute(f"INSERT INTO {table} (pk, b) VALUES (5, 'new-b5')")
+        expected[5] = {'pk': 5, 'a': None, 's': None, 'm': None, 'u': None, 'c': None, 'b': 'new-b5'}
+        check()
+
+        # An overwrite under the latest version, next to rows of every older one. An INSERT
+        # replaces the whole row.
+        cql.execute(f"INSERT INTO {table} (pk, a, b) VALUES (0, 100, 'b100')")
+        expected[0] = {'pk': 0, 'a': 100, 's': None, 'm': None, 'u': None, 'c': None, 'b': 'b100'}
+        check()
+
+# Test ALTER TABLE on a wide logstor table, whose schema frame is far larger than a record.
+def test_logstor_alter_wide_table(cql, test_keyspace):
+    columns = [f"c{i:03}_with_a_rather_long_column_name" for i in range(200)]
+    with new_test_table(cql, test_keyspace, "pk int PRIMARY KEY, " + ", ".join(f"{c} int" for c in columns),
+                        " WITH storage_engine = 'logstor'") as table:
+        for pk in range(5):
+            cql.execute(f"INSERT INTO {table} (pk, {columns[pk]}) VALUES ({pk}, {pk})")
+        cql.execute(f"ALTER TABLE {table} ADD extra text")
+        cql.execute(f"ALTER TABLE {table} DROP {columns[1]}")
+        cql.execute(f"INSERT INTO {table} (pk, extra) VALUES (5, 'e5')")
+        for pk in range(6):
+            row = cql.execute(f"SELECT * FROM {table} WHERE pk = {pk}").one()._asdict()
+            assert row.pop('pk') == pk
+            want = {c: None for c in columns if c != columns[1]} | {'extra': None}
+            if pk == 5:
+                want['extra'] = 'e5'
+            elif pk != 1:
+                want[columns[pk]] = pk
+            assert row == want
