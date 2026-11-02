@@ -237,6 +237,42 @@ async def test_recovery_basic(manager: ScyllaClusterManager, fail_separator_flus
             assert rows[0].pk == pk, f"Key {pk} has wrong pk value"
             assert rows[0].v == expected_v, f"Key {pk} has wrong value after additional writes"
 
+@pytest.mark.skip_mode(mode='release', reason='error injections are not supported in release mode')
+async def test_recovery_separates_more_than_two_buffers(manager: ScyllaClusterManager):
+    """
+    Recovery rewrites the live records of mixed segments through the separator, and each full
+    separator buffer needs a segment. Leave more live mixed data than two separator buffers hold,
+    restart, and check that recovery flushed them all.
+    """
+    cmdline = ['--logger-log-level', 'logstor=debug', '--smp=1']
+    cfg = {'experimental_features': ['logstor']}
+    servers = await manager.servers_add(1, cmdline=cmdline, config=cfg)
+    cql = manager.get_cql()
+
+    # Keep every record in mixed segments: no separator flush succeeds before the restart.
+    await manager.api.enable_injection(servers[0].ip_addr, "fail_flush_separator_buffer", one_shot=False)
+
+    async with new_test_keyspace(manager, "WITH tablets = {'initial': 1}") as ks:
+        await cql.run_async(f"CREATE TABLE {ks}.test (pk int PRIMARY KEY, v text) WITH storage_engine = 'logstor'")
+
+        value_size = 40 * 1024
+        nkeys = 4 * segment_size // value_size
+        expected = {pk: f"{pk}_" + 'x' * value_size for pk in range(nkeys)}
+        for pk, v in expected.items():
+            await cql.run_async(f"INSERT INTO {ks}.test (pk, v) VALUES ({pk}, '{v}')")
+
+        await manager.server_stop_gracefully(servers[0].server_id)
+        await manager.server_start(servers[0].server_id)
+        cql, _ = await manager.get_ready_cql(servers)
+
+        metrics = await manager.metrics.query(servers[0].ip_addr)
+        flushed = metrics.get("scylla_logstor_sm_separator_buffer_flushed") or 0
+        assert flushed > 2, f"Recovery flushed {flushed} separator buffers, expected more than two"
+
+        for pk, v in expected.items():
+            rows = await cql.run_async(f"SELECT v FROM {ks}.test WHERE pk = {pk}")
+            assert len(rows) == 1 and rows[0].v == v, f"Key {pk} wrong after recovery"
+
 async def test_recovery_with_segment_reuse(manager: ScyllaClusterManager):
     """
     Test recovery after segments have been compacted and reused.
