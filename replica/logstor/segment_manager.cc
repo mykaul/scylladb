@@ -652,6 +652,8 @@ class segment_manager_impl {
 
     seastar::gate _async_gate;
     future<> _reserve_replenisher{make_ready_future<>()};
+    bool _reserve_replenisher_started = false;
+    bool _started = false;
     seastar::condition_variable _segment_freed_cv;
 
     write_buffer_pool _compaction_buffer_pool;
@@ -802,6 +804,7 @@ public:
 private:
 
     future<> replenish_reserve();
+    void start_reserve_replenisher();
     future<seg_ptr> allocate_segment();
 
     future<> request_segment_switch();
@@ -848,7 +851,10 @@ private:
     }
 
     future<seg_ptr> get_segment(write_source src) {
-        seg_ptr seg = co_await _segment_pool.get_segment(src);
+        // Before start() compaction cannot run, so recovery's separator flushes, which free the
+        // mixed segments, may use the reserve.
+        const auto pool_src = src == write_source::separator && !_started ? write_source::compaction : src;
+        seg_ptr seg = co_await _segment_pool.get_segment(pool_src);
         seg->start(make_segment_ref(seg->id()), allocate_segment_seq());
         co_return seg;
     }
@@ -1121,13 +1127,21 @@ segment_manager_impl::segment_manager_impl(segment_manager_config config)
     });
 }
 
-future<> segment_manager_impl::start() {
-    // Start background replenisher before creating initial segment
+void segment_manager_impl::start_reserve_replenisher() {
+    if (std::exchange(_reserve_replenisher_started, true)) {
+        return;
+    }
     _reserve_replenisher = with_scheduling_group(_cfg.compaction_sg, [this] {
         return replenish_reserve();
     });
+}
+
+future<> segment_manager_impl::start() {
+    // Start background replenisher before creating initial segment, unless recovery started it
+    start_reserve_replenisher();
 
     co_await _compaction_mgr.start();
+    _started = true;
 
     _separator_fiber = with_scheduling_group(_cfg.separator_sg, [this] {
         return run_separator_fiber();
@@ -2304,6 +2318,11 @@ future<> segment_manager_impl::do_recovery(replica::database& db) {
     const file_id_t used_file_count = used_segment_count > 0 ? max_used_seg_idx / _segments_per_file + 1 : 0;
     co_await files.retire_unused_files(used_file_count);
 
+    // Separator flushes of the mixed segments below need segments, so fill the reserve first.
+    _next_segment_seq = max_segment_seq + 1;
+    co_await files.finish();
+    start_reserve_replenisher();
+
     uint64_t recovered_used_segment_count = 0;
     if (used_segments.size() > 0) {
         for (auto seg_idx = used_segments.find_first_set(); seg_idx != utils::dynamic_bitset::npos; seg_idx = used_segments.find_next_set(seg_idx)) {
@@ -2318,10 +2337,6 @@ future<> segment_manager_impl::do_recovery(replica::database& db) {
             recovered_used_segment_count++;
         }
     }
-
-    _next_segment_seq = max_segment_seq + 1;
-
-    co_await files.finish();
 
     logstor_logger.info("Recovery complete");
 }
