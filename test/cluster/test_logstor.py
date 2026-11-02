@@ -326,6 +326,58 @@ async def test_recovery_with_no_more_free_segments_than_the_reserve(manager: Scy
             rows = await cql.run_async(f"SELECT v FROM {ks}.test WHERE pk = {pk}")
             assert len(rows) == 1 and rows[0].v == v, f"Key {pk} wrong after recovery"
 
+@pytest.mark.skip_mode(mode='release', reason='error injections are not supported in release mode')
+@pytest.mark.parametrize("free_target", [8, 10, 12, 13, 14, 15, 16, 20, 24])
+@pytest.mark.parametrize("tablets", [16])
+async def test_recovery_mixed_data_spread_over_many_groups(manager: ScyllaClusterManager, tablets: int, free_target: int):
+    """
+    Every mixed segment holds records of many compaction groups, and recovery buffers them per group.
+    A mixed segment is freed only after every group buffer holding one of its records is flushed, so
+    with few free segments the flushes of the first full buffers may take all of them before any
+    mixed segment is freed. Restart with free_target free segments and check that startup completes.
+    """
+    cmdline = ['--logger-log-level', 'logstor=debug', '--smp=1']
+    cfg = {
+        'logstor_disk_size_in_mb': 8,
+        'logstor_file_size_in_mb': 1,
+        'experimental_features': ['logstor']
+    }
+    servers = await manager.servers_add(1, cmdline=cmdline, config=cfg)
+    cql = manager.get_cql()
+
+    async def free_segments() -> int:
+        metrics = await manager.metrics.query(servers[0].ip_addr)
+        return int(metrics.get("scylla_logstor_sm_free_segments") or 0)
+
+    # Keep every record in mixed segments: no separator flush succeeds before the restart.
+    await manager.api.enable_injection(servers[0].ip_addr, "fail_flush_separator_buffer", one_shot=False)
+
+    async with new_test_keyspace(manager, f"WITH tablets = {{'initial': {tablets}}}") as ks:
+        await cql.run_async(f"CREATE TABLE {ks}.test (pk int PRIMARY KEY, v text) WITH storage_engine = 'logstor'")
+
+        # Small records, so each segment holds records of all tablets. A normal write takes a segment
+        # only while more than the reserve is free, so free_target must be above the reserve to stop at.
+        value_size = 2 * 1024
+        max_writes = 8 * 1024 * 1024 // value_size
+        expected = {}
+        while await free_segments() > free_target:
+            assert len(expected) < max_writes, f"Did not get down to {free_target} free segments in {max_writes} writes"
+            pk = len(expected)
+            v = f"{pk}_" + 'x' * value_size
+            await cql.run_async(f"INSERT INTO {ks}.test (pk, v) VALUES ({pk}, '{v}')")
+            expected[pk] = v
+        free = await free_segments()
+        assert free == free_target, f"Stopped at {free} free segments, expected {free_target}"
+        logging.info(f"Wrote {len(expected)} keys, {free} free segments, {await get_tablet_count(manager, servers[0], ks, 'test')} tablets")
+
+        await manager.server_stop_gracefully(servers[0].server_id)
+        await manager.server_start(servers[0].server_id, timeout=120)
+        cql, _ = await manager.get_ready_cql(servers)
+
+        for pk, v in expected.items():
+            rows = await cql.run_async(f"SELECT v FROM {ks}.test WHERE pk = {pk}")
+            assert len(rows) == 1 and rows[0].v == v, f"Key {pk} wrong after recovery"
+
 async def test_recovery_with_segment_reuse(manager: ScyllaClusterManager):
     """
     Test recovery after segments have been compacted and reused.
