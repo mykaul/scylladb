@@ -21,6 +21,10 @@
 #include "test/lib/sstable_utils.hh"
 #include "test/lib/test_services.hh"
 #include "test/lib/random_utils.hh"
+#include <array>
+#include <seastar/testing/linux_perf_event.hh>
+#include <seastar/util/closeable.hh>
+#include <seastar/core/memory.hh>
 #include <boost/accumulators/framework/accumulator_set.hpp>
 #include <boost/accumulators/framework/features.hpp>
 #include <boost/accumulators/statistics/mean.hpp>
@@ -85,6 +89,11 @@ public:
     }
 };
 
+// Totals over all compaction runs on this shard, reported per partition by the tool.
+inline thread_local uint64_t compaction_instructions = 0;
+inline thread_local uint64_t compaction_mallocs = 0;
+inline thread_local uint64_t compaction_partitions = 0;
+
 class perf_sstable_test_env {
     test_env _env;
 
@@ -99,6 +108,7 @@ public:
         sstring dir;
         compaction::compaction_strategy_type compaction_strategy;
         api::timestamp_type timestamp_range;
+        unsigned rows_per_partition = 0;
     };
 
 private:
@@ -132,6 +142,9 @@ private:
     schema_ptr create_schema(compaction::compaction_strategy_type type) {
         schema_builder builder(this_smp_shard_count(), "ks", "perf-test", generate_legacy_id("ks", "perf-test"));
         builder.with_column("name", utf8_type, column_kind::partition_key);
+        if (_cfg.rows_per_partition) {
+            builder.with_column("ck", int32_type, column_kind::clustering_key);
+        }
         for (unsigned i = 0; i < _cfg.num_columns; ++i) {
             builder.with_column(to_bytes(format("column{:04d}", i)), utf8_type);
         }
@@ -212,9 +225,12 @@ public:
         auto local_keys = tests::generate_partition_keys(int(_cfg.partitions / _cfg.sstables), s, local_shard_only::yes, tests::key_size{_cfg.key_size, _cfg.key_size});
         return do_for_each(idx.begin(), idx.end(), [this, local_keys = std::move(local_keys)] (auto iteration) {
             auto mut = mutation(this->s, local_keys.at(iteration));
-            for (auto& cdef: this->s->regular_columns()) {
-                const auto ts = _cfg.timestamp_range ? tests::random::get_int<api::timestamp_type>(-_cfg.timestamp_range, _cfg.timestamp_range) : 0;
-                mut.set_clustered_cell(clustering_key::make_empty(), cdef, atomic_cell::make_live(*utf8_type, ts, utf8_type->decompose(this->random_column())));
+            for (unsigned row = 0; row < std::max(_cfg.rows_per_partition, 1u); ++row) {
+                auto ck = _cfg.rows_per_partition ? clustering_key::from_single_value(*this->s, int32_type->decompose(int32_t(row))) : clustering_key::make_empty();
+                for (auto& cdef: this->s->regular_columns()) {
+                    const auto ts = _cfg.timestamp_range ? tests::random::get_int<api::timestamp_type>(-_cfg.timestamp_range, _cfg.timestamp_range) : 0;
+                    mut.set_clustered_cell(ck, cdef, atomic_cell::make_live(*utf8_type, ts, utf8_type->decompose(this->random_column())));
+                }
             }
             this->_mt->apply(std::move(mut));
             return make_ready_future<>();
@@ -276,7 +292,11 @@ public:
                 tasks::task_manager tm;
                 auto cm = make_lw_shared<compaction::compaction_manager>(tm, compaction::compaction_manager::for_testing_tag{});
                 auto cf = make_lw_shared<replica::column_family>(s, env.make_table_config(), make_lw_shared<replica::storage_options>(), *cm, nullptr, env.manager(), cl_stats, tracker, nullptr);
+                auto close_cf = deferred_stop(*cf);
 
+                auto instructions = linux_perf_event::user_instructions_retired();
+                auto mallocs_before = seastar::memory::stats().mallocs();
+                instructions.enable();
                 auto start = perf_sstable_test_env::now();
 
                 auto descriptor = compaction::compaction_descriptor(std::move(ssts));
@@ -290,6 +310,9 @@ public:
                 compaction::compaction_progress_monitor progress_monitor;
                 auto ret = compaction::compact_sstables(std::move(descriptor), cdata, cf->try_get_compaction_group_view_with_static_sharding(), progress_monitor).get();
                 auto end = perf_sstable_test_env::now();
+                instructions.disable();
+                compaction_instructions += instructions.read();
+                compaction_mallocs += seastar::memory::stats().mallocs() - mallocs_before;
 
                 auto partitions_per_sstable = _cfg.partitions / _cfg.sstables;
                 if (_cfg.compaction_strategy != compaction::compaction_strategy_type::time_window) {
@@ -300,6 +323,7 @@ public:
                 });
                 SCYLLA_ASSERT(total_keys_written >= partitions_per_sstable);
 
+                compaction_partitions += total_keys_written;
                 auto duration = std::chrono::duration<double>(end - start).count();
                 return total_keys_written / duration;
             });
@@ -328,7 +352,8 @@ public:
                     if (!m) {
                         *done = true;
                     } else {
-                        auto row = m->partition().find_row(*s, clustering_key::make_empty());
+                        const auto ck = _cfg.rows_per_partition ? clustering_key::from_single_value(*s, int32_type->decompose(int32_t(0))) : clustering_key::make_empty();
+                        auto row = m->partition().find_row(*s, ck);
                         if (!row || row->size() != _cfg.num_columns) {
                             throw std::invalid_argument("Invalid sstable found. Maybe you ran write mode with different num_columns settings?");
                         } else {

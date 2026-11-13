@@ -37,6 +37,15 @@ future<> test_compaction(sharded<perf_sstable_test_env>& dt) {
             return t.fill_memtable();
         }).then([&dt] {
             return time_runs(iterations, parallelism, dt, &perf_sstable_test_env::compaction);
+        }).then([&dt] {
+            return dt.map_reduce0([] (perf_sstable_test_env&) {
+                return std::array<uint64_t, 3>{compaction_instructions, compaction_mallocs, compaction_partitions};
+            }, std::array<uint64_t, 3>{}, [] (auto a, auto b) {
+                return std::array<uint64_t, 3>{a[0] + b[0], a[1] + b[1], a[2] + b[2]};
+            }).then([] (auto t) {
+                std::cout << format("compaction: {:.1f} instructions / partition, {:.2f} allocations / partition\n",
+                        double(t[0]) / t[2], double(t[1]) / t[2]);
+            });
         }).get();
     });
 }
@@ -115,6 +124,7 @@ int scylla_sstable_main(int argc, char** argv) {
         ("testdir", bpo::value<sstring>()->default_value("/var/lib/scylla/perf-tests"), "directory in which to store the sstables")
         ("compaction-strategy", bpo::value<sstring>()->default_value("IncrementalCompactionStrategy"), "compaction strategy to use, one of "
              "(IncrementalCompactionStrategy, LeveledCompactionStrategy, TimeWindowCompactionStrategy)")
+        ("rows-per-partition", bpo::value<unsigned>()->default_value(0), "clustering rows per partition; 0 means a single row without a clustering key")
         ("timestamp-range", bpo::value<api::timestamp_type>()->default_value(0), "Timestamp values to use, chosen uniformly from: [-x, +x]");
 
     return app.run(argc, argv, [&app] {
@@ -140,6 +150,7 @@ int scylla_sstable_main(int argc, char** argv) {
             }
             cfg.compaction_strategy = compaction::compaction_strategy::type(app.configuration()["compaction-strategy"].as<sstring>());
             cfg.timestamp_range = app.configuration()["timestamp-range"].as<api::timestamp_type>();
+            cfg.rows_per_partition = app.configuration()["rows-per-partition"].as<unsigned>();
             auto scf = make_sstable_compressor_factory_for_tests_in_thread();
             test.start(std::move(cfg), std::ref(*scf)).get();
             auto stop_test = deferred_stop(test);
