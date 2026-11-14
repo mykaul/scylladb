@@ -732,19 +732,39 @@ void write_counter_cell(RowWriter& w, const query::partition_slice& slice, ::ato
             .end_qr_cell();
 }
 
-// A cell's hash as fed into a fresh xx_hasher, i.e. the cached cell hash.
-static uint64_t cell_xxhash(atomic_cell_or_collection_view c, const column_definition& def) {
-    if (def.is_atomic()) {
-        return atomic_cell_xxhash(c.as_atomic_cell(def), def);
+// Feeds a collection like feed_hash(h, cm, def) and returns its newest timestamp from the same walk.
+static cell_hash collection_cell_digest(collection_mutation_view cm, const column_definition& def) {
+    xx_hasher h;
+    auto tomb = cm.tomb();
+    feed_hash(h, tomb);
+    auto max_ts = tomb.timestamp;
+    for (auto&& [key, value] : cm) {
+        feed_hash(h, key);
+        feed_hash(h, value, def);
+        max_ts = std::max(max_ts, value.timestamp());
     }
-    query::default_hasher h;
-    feed_hash(h, c.as_collection_mutation(), def);
-    return h.finalize_uint64();
+    return cell_hash{h.finalize_uint64(), max_ts};
+}
+
+// A cell's digest and newest timestamp, as cached by row::prepare_hash(); the digest is the one
+// feed_cell_hashes() computes for an uncached cell.
+static cell_hash cell_digest(atomic_cell_or_collection_view cell, const column_definition& def) {
+    if (def.is_atomic()) {
+        auto c = cell.as_atomic_cell(def);
+        return cell_hash{atomic_cell_xxhash(c, def), c.timestamp()};
+    }
+    return collection_cell_digest(cell.as_collection_mutation(), def);
 }
 
 // A cell's max timestamp, as fed to max_timestamp by the digest.
 static api::timestamp_type cell_max_timestamp(atomic_cell_or_collection_view c, const column_definition& def) {
     return def.is_atomic() ? c.as_atomic_cell(def).timestamp() : c.as_collection_mutation().last_update(*def.type);
+}
+
+// As above, but from the cached hash if it carries the max timestamp.
+static api::timestamp_type cell_max_timestamp(const cell_and_hash_view& c, const column_definition& def) {
+    auto ch = c.cached_hash();
+    return ch && ch->max_ts != api::missing_timestamp ? ch->max_ts : cell_max_timestamp(c.cell, def);
 }
 
 // Feeds the hash of each column in ids, or null_hash_value if it is absent.
@@ -772,17 +792,18 @@ static void feed_cell_hashes(Hasher& h, const row& cells, const schema& s, colum
             }
         } else {
             auto cm = cell_and_hash->cell.as_collection_mutation();
-            max_ts.update(cm.last_update(*def.type));
             if constexpr (query::using_hash_of_hash_v<Hasher>) {
                 auto ch = cell_and_hash->cached_hash();
                 if (ch) {
+                    max_ts.update(cell_max_timestamp(*cell_and_hash, def));
                     feed_hash(h, *ch);
                 } else {
-                    Hasher cellh;
-                    feed_hash(cellh, cm, def);
-                    feed_hash(h, cellh.finalize_uint64());
+                    auto d = collection_cell_digest(cm, def);
+                    max_ts.update(d.max_ts);
+                    feed_hash(h, d.hash);
                 }
             } else {
+                max_ts.update(cm.last_update(*def.type));
                 feed_hash(h, cm, def);
             }
         }
@@ -829,11 +850,15 @@ static void feed_row_digest(buffered_xx_hasher& h, const row& cells, const schem
                 feed_hash(h, c, def);
                 continue;
             }
-        } else {
-            max_ts.update(cell_and_hash->cell.as_collection_mutation().last_update(*def.type));
         }
         auto ch = cell_and_hash->cached_hash();
-        feed_hash(h, ch ? ch->hash : cell_xxhash(cell_and_hash->cell, def));
+        if (ch) {
+            max_ts.update(cell_max_timestamp(*cell_and_hash, def));
+        } else {
+            ch = cell_digest(cell_and_hash->cell, def);
+            max_ts.update(ch->max_ts);
+        }
+        feed_hash(h, ch->hash);
     }
 }
 
@@ -841,8 +866,16 @@ static void feed_row_digest(buffered_xx_hasher& h, const row& cells, const schem
 // noinline keeps the 4 KB hasher buffer out of the querier's frame.
 [[gnu::noinline]] static uint64_t row_digest(const row& cells, const schema& s, column_kind kind, const query::column_id_vector& columns, bool all_columns, max_timestamp& max_ts) {
     if (auto rh = all_columns ? cells.row_hash() : cell_hash_opt()) {
+        // Cells come in id order, so the finder reuses the block.
+        row::cell_and_hash_finder find_hash(cells);
         cells.for_each_cell([&] (column_id id, atomic_cell_or_collection_view c) {
-            max_ts.update(cell_max_timestamp(c, s.column_at(kind, id)));
+            auto& def = s.column_at(kind, id);
+            if (def.is_atomic()) {
+                max_ts.update(c.as_atomic_cell(def).timestamp());
+                return;
+            }
+            // Collections only: the cached timestamp needs a hash-slot lookup.
+            max_ts.update(cell_max_timestamp(*find_hash(id), def));
         });
         return rh->hash;
     }
@@ -878,7 +911,7 @@ void row::prepare_hash_slow(const schema& s, column_kind kind, digest_request dr
         bitmask::for_each_set(block.hashed(), [&] (unsigned slot) {
             auto* hash = block.hash(slot);
             if (!*hash) {
-                *hash = cell_hash{cell_xxhash(atomic_cell_or_collection_view(block.cell(slot)), s.column_at(kind, column_of(block_index, slot)))};
+                *hash = cell_digest(atomic_cell_or_collection_view(block.cell(slot)), s.column_at(kind, column_of(block_index, slot)));
             }
         });
     });
@@ -886,7 +919,7 @@ void row::prepare_hash_slow(const schema& s, column_kind kind, digest_request dr
         buffered_xx_hasher rowh;
         max_timestamp unused;
         feed_row_digest(rowh, *this, s, kind, std::views::iota(column_id(0), column_id(s.columns_count(kind))), unused);
-        _row_hash = cell_hash{rowh.finalize_uint64()};
+        _row_hash = rowh.finalize_uint64();
     }
 }
 

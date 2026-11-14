@@ -105,7 +105,8 @@ class row {
     using block_being_rebuilt = cells_type::block_being_rebuilt;
     cells_type _cells;
     // xxHash_row hash of all columns of the row's kind (see row_hash()); cleared on change.
-    mutable cell_hash_opt _row_hash;
+    // A bare hash rather than cell_hash, to keep row small.
+    mutable cell_hash::size_type _row_hash = cell_hash::no_hash;
 
     static block_index_type block_index_of(column_id id) noexcept {
         return id >> atomic_cell_or_collection_block_slot_bits;
@@ -439,8 +440,8 @@ public:
     void clear_hash() const;
     // The digest of all columns of the row's kind, in id order, as fed by
     // digest_algorithm::xxHash_row. Set by prepare_hash(..., cells_and_row).
-    cell_hash_opt row_hash() const noexcept { return _row_hash; }
-    void set_row_hash_for_test(cell_hash h) const noexcept { _row_hash = h; }
+    cell_hash_opt row_hash() const noexcept { return cell_hash{_row_hash}; }
+    void set_row_hash_for_test(cell_hash h) const noexcept { _row_hash = h.hash; }
 
     bool is_live(const schema&, column_kind kind, tombstone tomb = tombstone(), gc_clock::time_point now = gc_clock::time_point::min()) const;
 
