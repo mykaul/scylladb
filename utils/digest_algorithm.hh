@@ -15,6 +15,7 @@ namespace query {
 enum class digest_algorithm : uint8_t {
     none = 0,  // digest not required
     xxHash = 3, // default algorithm
+    xxHash_row = 4, // xxHash, but each row is fed as one hash of its cells
 };
 
 }
