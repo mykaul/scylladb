@@ -10,6 +10,10 @@
 
 #include "utils/assert.hh"
 #include <seastar/util/closeable.hh>
+#include <fcntl.h>
+#include <unistd.h>
+#include <cstdlib>
+#include <cstring>
 #include <seastar/core/seastar.hh>
 
 #include "sstables/sstable_set.hh"
@@ -93,6 +97,17 @@ public:
 inline thread_local uint64_t compaction_instructions = 0;
 inline thread_local uint64_t compaction_mallocs = 0;
 inline thread_local uint64_t compaction_partitions = 0;
+
+// Lets `perf record --control=fifo:$PERF_CTL_FIFO` sample only the compaction itself.
+inline void perf_ctl(const char* cmd) {
+    static const char* path = std::getenv("PERF_CTL_FIFO");
+    if (path) {
+        if (int fd = ::open(path, O_WRONLY | O_NONBLOCK); fd >= 0) {
+            [[maybe_unused]] auto r = ::write(fd, cmd, std::strlen(cmd));
+            ::close(fd);
+        }
+    }
+}
 
 class perf_sstable_test_env {
     test_env _env;
@@ -308,7 +323,9 @@ public:
                 descriptor.gc_state = cf->try_get_compaction_group_view_with_static_sharding().get_tombstone_gc_state();
                 auto cdata = compaction::compaction_manager::create_compaction_data();
                 compaction::compaction_progress_monitor progress_monitor;
+                perf_ctl("enable\n");
                 auto ret = compaction::compact_sstables(std::move(descriptor), cdata, cf->try_get_compaction_group_view_with_static_sharding(), progress_monitor).get();
+                perf_ctl("disable\n");
                 auto end = perf_sstable_test_env::now();
                 instructions.disable();
                 compaction_instructions += instructions.read();
