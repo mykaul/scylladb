@@ -403,6 +403,13 @@ public:
     uint64_t index_size() const {
         return _index_file_size;
     }
+    // BTI index components; zero for the big format.
+    uint64_t partitions_size() const {
+        return _partitions_file_size;
+    }
+    uint64_t rows_size() const {
+        return _rows_file_size;
+    }
     file& index_file() {
         return _index_file;
     }

@@ -153,6 +153,7 @@ public:
         utils::updateable_value<uint32_t> large_data_records_per_sstable = utils::updateable_value<uint32_t>(10);
         bool ignore_component_digest_mismatch = false;
         bool enable_dangerous_direct_import_of_cassandra_counters = false;
+        utils::updateable_value<bool> compaction_skip_shadowed_data = utils::updateable_value<bool>(false);
     };
 
 private:

@@ -2,12 +2,13 @@
 #
 # SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
 
+import pytest
 import requests
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
 
-from ..cqlpy.util import new_test_table, new_test_keyspace, sleep_till_whole_second
+from ..cqlpy.util import config_value_context, new_test_table, new_test_keyspace, sleep_till_whole_second
 
 @dataclass
 class TombstonePurgeStats:
@@ -134,8 +135,9 @@ def alterSomeData(cql, cf: str, timestamp: int | None = None):
     cql.execute(f"DELETE FROM {cf} {using_timestamp} WHERE pk=5")
 
 
-def test_compactionhistory_rows_merged_null_compaction_strategy(cql, rest_api):
-    with new_test_keyspace(cql, "WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 1}") as ks:
+@pytest.mark.parametrize("skip", [False, True])
+def test_compactionhistory_rows_merged_null_compaction_strategy(cql, rest_api, skip):
+    with config_value_context(cql, "compaction_skip_shadowed_data", str(skip).lower()), new_test_keyspace(cql, "WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 1}") as ks:
         with new_test_table(cql, ks, "pk int, ck int, v int, PRIMARY KEY (pk, ck)", "WITH compaction = {'class': 'NullCompactionStrategy'};") as cf:
             populateSomeData(cql, cf, (1, 6))
             response = rest_api.send("POST", f"storage_service/keyspace_flush/{ks}")
@@ -149,11 +151,13 @@ def test_compactionhistory_rows_merged_null_compaction_strategy(cql, rest_api):
             assert response.status_code == requests.codes.ok
 
             response = waitAndGetCompleteCompactionHistory(rest_api, cf)
-            assert extractRowsMergedAsSortedList(response, ks) == [{"key": 1, "value": 27}, {"key": 2, "value": 10}]
+            # With skipping, the 5 rows of pk=5 deleted by the newer partition tombstone are never read.
+            assert extractRowsMergedAsSortedList(response, ks) == [{"key": 1, "value": 22 if skip else 27}, {"key": 2, "value": 10}]
 
 
-def test_compactionhistory_rows_merged_time_window_compaction_strategy(cql, rest_api):
-    with new_test_keyspace(cql, "WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 1}") as ks:
+@pytest.mark.parametrize("skip", [False, True])
+def test_compactionhistory_rows_merged_time_window_compaction_strategy(cql, rest_api, skip):
+    with config_value_context(cql, "compaction_skip_shadowed_data", str(skip).lower()), new_test_keyspace(cql, "WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 1}") as ks:
         compaction_opt = "{'class': 'TimeWindowCompactionStrategy', 'compaction_window_unit': 'MINUTES', 'compaction_window_size': 1}"
         with new_test_table(cql, ks, "pk int, ck int, v int, PRIMARY KEY (pk, ck)",
                             f"WITH compaction = {compaction_opt};") as cf:
@@ -180,7 +184,8 @@ def test_compactionhistory_rows_merged_time_window_compaction_strategy(cql, rest
             assert response.status_code == requests.codes.ok
 
             response = waitAndGetCompleteCompactionHistory(rest_api, cf)
-            assert extractRowsMergedAsSortedList(response, ks) == [{"key": 1, "value": 27}, {"key": 2, "value": 10}]
+            # With skipping, the 5 rows of pk=5 deleted by the newer partition tombstone are never read.
+            assert extractRowsMergedAsSortedList(response, ks) == [{"key": 1, "value": 22 if skip else 27}, {"key": 2, "value": 10}]
 
 
 def test_compactionhistory_tombstone_purge_statistics(cql, rest_api):

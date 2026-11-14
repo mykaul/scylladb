@@ -877,6 +877,23 @@ private:
         return _tombstone_gc_state;
     }
 
+    // Skipping needs an input whose tombstones are newer than all data of another input.
+    bool shadowed_data_skippable(const sstables::sstable_set& ssts) {
+        if (!_table_s.get_sstables_manager().get_config().compaction_skip_shadowed_data()) {
+            return false;
+        }
+        auto newest_with_tombstones = api::min_timestamp;
+        auto oldest_max = api::max_timestamp;
+        for (auto& sst : *ssts.all()) {
+            auto& st = sst->get_stats_metadata();
+            if (!st.estimated_tombstone_drop_time.bin.empty()) {
+                newest_with_tombstones = std::max(newest_with_tombstones, st.max_timestamp);
+            }
+            oldest_max = std::min(oldest_max, st.max_timestamp);
+        }
+        return newest_with_tombstones > oldest_max;
+    }
+
     future<> setup() {
         auto ssts = make_lw_shared<sstables::sstable_set>(make_sstable_set_for_input());
         auto fully_expired = _table_s.fully_expired_sstables(_sstables, gc_clock::now());
@@ -926,6 +943,7 @@ private:
             }
         }
         _cdata.compaction_size += compaction_size;        
+        _reader_statistics.skip_shadowed = shadowed_data_skippable(*ssts);
         log_debug("{} [{}]", report_start_desc(), fmt::join(_sstables | std::views::transform([] (auto sst) { return to_string(sst, true); }), ","));
         if (repaired_at) {
             _output_repaired_at = repaired_at;

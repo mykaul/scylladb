@@ -19,6 +19,15 @@
 #include "reader_permit.hh"
 #include "seastarx.hh"
 
+// Published by the combined reader during compaction: while `active`, rows of
+// partition `key` positioned before `end` are covered by range tombstone `tomb`.
+struct shadowed_range_hint {
+    bool active = false;
+    tombstone tomb;
+    position_in_partition end = position_in_partition::before_all_clustered_rows();
+    std::optional<dht::decorated_key> key;
+};
+
 /// \brief Represents a stream of mutation fragments.
 ///
 /// Mutation fragments represent writes to the database.
@@ -354,6 +363,11 @@ public:
         // Similar to destructors, close must never fail.
         virtual future<> close() noexcept = 0;
 
+        // Compaction-only hints from the combined reader. A reader may drop
+        // data that `t` (or the hint) provably shadows; the default ignores them.
+        virtual void skip_shadowed_partition(tombstone t) {}
+        virtual void set_shadowed_range_hint(const shadowed_range_hint*) noexcept {}
+
         size_t buffer_size() const {
             return _buffer_size;
         }
@@ -411,6 +425,9 @@ public:
         _impl->set_close_required();
         return _impl->operator()();
     }
+
+    void skip_shadowed_partition(tombstone t) { _impl->skip_shadowed_partition(t); }
+    void set_shadowed_range_hint(const shadowed_range_hint* h) noexcept { _impl->set_shadowed_range_hint(h); }
 
     template <typename Consumer>
     requires FlatMutationReaderConsumerV2<Consumer>

@@ -25,6 +25,8 @@
 #include "test/lib/sstable_utils.hh"
 #include "test/lib/test_services.hh"
 #include "test/lib/random_utils.hh"
+#include "db/config.hh"
+#include "sstables/stats.hh"
 #include <array>
 #include <seastar/testing/linux_perf_event.hh>
 #include <seastar/util/closeable.hh>
@@ -97,6 +99,8 @@ public:
 inline thread_local uint64_t compaction_instructions = 0;
 inline thread_local uint64_t compaction_mallocs = 0;
 inline thread_local uint64_t compaction_partitions = 0;
+inline thread_local uint64_t compaction_read_bytes = 0;
+inline thread_local uint64_t compaction_read_ahead_discarded_bytes = 0;
 
 // Lets `perf record --control=fifo:$PERF_CTL_FIFO` sample only the compaction itself.
 inline void perf_ctl(const char* cmd) {
@@ -126,6 +130,11 @@ public:
         unsigned rows_per_partition = 0;
         unsigned overlap_percent = 100;
         bool compressible = false;
+        // Newest input deletes this percent of the shared keys, newer than all other inputs.
+        unsigned delete_percent = 0;
+        // 0: partition tombstones; otherwise a range tombstone over the first N rows.
+        unsigned delete_rows = 0;
+        bool skip_shadowed = false;
     };
 
 private:
@@ -254,6 +263,11 @@ public:
         return _env.stop();
     }
 
+    // Each compaction input gets its own memtable (own keys, timestamps or deletions).
+    bool regenerate_inputs() const {
+        return _cfg.overlap_percent < 100 || _cfg.delete_percent;
+    }
+
     // sst_idx picks the unique keys of one input; overlap_percent of the keys are shared by all inputs.
     future<> fill_memtable(unsigned sst_idx = 0) {
         const unsigned per_sst = _cfg.partitions / _cfg.sstables;
@@ -263,13 +277,27 @@ public:
         if (_keys.empty()) {
             _keys = tests::generate_partition_keys(shared + unique * _cfg.sstables, s, local_shard_only::yes, tests::key_size{_cfg.key_size, _cfg.key_size});
         }
-        return do_for_each(idx.begin(), idx.end(), [this, shared, unique, sst_idx] (auto iteration) {
+        // Inputs get ordered timestamps, like flushes; the newest one may delete shared keys.
+        const api::timestamp_type base_ts = regenerate_inputs() ? sst_idx : 0;
+        const unsigned deleted = _cfg.delete_percent && sst_idx + 1 == _cfg.sstables ? shared * _cfg.delete_percent / 100 : 0;
+        return do_for_each(idx.begin(), idx.end(), [this, shared, unique, sst_idx, base_ts, deleted] (auto iteration) {
             const unsigned k = iteration < int(shared) ? iteration : shared + unique * sst_idx + (iteration - shared);
             auto mut = mutation(this->s, _keys.at(k));
+            if (unsigned(iteration) < deleted) {
+                auto t = tombstone(_cfg.sstables + _cfg.timestamp_range, gc_clock::now());
+                if (_cfg.delete_rows) {
+                    auto ck = [this] (int32_t v) { return clustering_key::from_single_value(*this->s, int32_type->decompose(v)); };
+                    mut.partition().apply_delete(*this->s, range_tombstone(ck(0), bound_kind::incl_start, ck(_cfg.delete_rows), bound_kind::excl_end, t));
+                } else {
+                    mut.partition().apply(t);
+                }
+                this->_mt->apply(std::move(mut));
+                return make_ready_future<>();
+            }
             for (unsigned row = 0; row < std::max(_cfg.rows_per_partition, 1u); ++row) {
                 auto ck = _cfg.rows_per_partition ? clustering_key::from_single_value(*this->s, int32_type->decompose(int32_t(row))) : clustering_key::make_empty();
                 for (auto& cdef: this->s->regular_columns()) {
-                    const auto ts = _cfg.timestamp_range ? tests::random::get_int<api::timestamp_type>(-_cfg.timestamp_range, _cfg.timestamp_range) : 0;
+                    const auto ts = _cfg.timestamp_range ? tests::random::get_int<api::timestamp_type>(-_cfg.timestamp_range, _cfg.timestamp_range) : base_ts;
                     mut.set_clustered_cell(ck, cdef, atomic_cell::make_live(*utf8_type, ts, utf8_type->decompose(this->random_column())));
                 }
             }
@@ -322,13 +350,13 @@ public:
                 std::vector<shared_sstable> ssts;
                 for (auto i = 0u; i < _cfg.sstables; i++) {
                     auto sst = sst_gen();
-                    if (_cfg.overlap_percent < 100) {
+                    if (regenerate_inputs()) {
                         _mt = make_lw_shared<replica::memtable>(s);
                         fill_memtable(i).get();
                     }
                     write_memtable_to_sstable(*_mt, sst).get();
                     sst->open_data().get();
-                    if (_cfg.overlap_percent >= 100) {
+                    if (!regenerate_inputs()) {
                         _mt->revert_flushed_memory();
                     }
                     ssts.push_back(std::move(sst));
@@ -341,10 +369,7 @@ public:
                 auto cf = make_lw_shared<replica::column_family>(s, env.make_table_config(), make_lw_shared<replica::storage_options>(), *cm, nullptr, env.manager(), cl_stats, tracker, nullptr);
                 auto close_cf = deferred_stop(*cf);
 
-                auto instructions = linux_perf_event::user_instructions_retired();
-                auto mallocs_before = seastar::memory::stats().mallocs();
-                instructions.enable();
-                auto start = perf_sstable_test_env::now();
+                env.db_config().compaction_skip_shadowed_data.set(bool(_cfg.skip_shadowed));
 
                 auto descriptor = compaction::compaction_descriptor(std::move(ssts));
                 descriptor.enable_garbage_collection(cf->get_sstable_set());
@@ -355,6 +380,11 @@ public:
                 descriptor.gc_state = cf->try_get_compaction_group_view_with_static_sharding().get_tombstone_gc_state();
                 auto cdata = compaction::compaction_manager::create_compaction_data();
                 compaction::compaction_progress_monitor progress_monitor;
+                const auto io_before = engine().get_io_stats();
+                auto instructions = linux_perf_event::user_instructions_retired();
+                auto mallocs_before = seastar::memory::stats().mallocs();
+                instructions.enable();
+                auto start = perf_sstable_test_env::now();
                 perf_ctl("enable\n");
                 auto ret = compaction::compact_sstables(std::move(descriptor), cdata, cf->try_get_compaction_group_view_with_static_sharding(), progress_monitor).get();
                 perf_ctl("disable\n");
@@ -362,6 +392,9 @@ public:
                 instructions.disable();
                 compaction_instructions += instructions.read();
                 compaction_mallocs += seastar::memory::stats().mallocs() - mallocs_before;
+                const auto& io_after = engine().get_io_stats();
+                compaction_read_bytes += io_after.fstream_read_bytes - io_before.fstream_read_bytes;
+                compaction_read_ahead_discarded_bytes += io_after.fstream_read_ahead_discarded_bytes - io_before.fstream_read_ahead_discarded_bytes;
 
                 auto partitions_per_sstable = _cfg.partitions / _cfg.sstables;
                 if (_cfg.compaction_strategy != compaction::compaction_strategy_type::time_window) {

@@ -36,6 +36,12 @@ class sstables_stats {
         uint64_t closed_for_writing = 0;
         uint64_t deleted = 0;
         uint64_t promoted_index_auto_scale_events = 0;
+        // Compaction inputs dropping data shadowed by another input's tombstone.
+        uint64_t shadowed_partitions_skipped = 0;
+        uint64_t shadowed_rows_skipped = 0;
+        uint64_t shadowed_range_rows_skipped = 0;
+        uint64_t shadowed_jumps = 0;
+        uint64_t shadowed_bytes_jumped = 0;
     } _shard_stats;
 
     stats& _stats = _shard_stats;
@@ -129,6 +135,20 @@ public:
 
     inline void on_promoted_index_auto_scale() noexcept {
         ++_stats.promoted_index_auto_scale_events;
+    }
+
+    inline void on_shadowed_partition_skip() noexcept {
+        ++_stats.shadowed_partitions_skipped;
+    }
+    inline void on_shadowed_row_skip() noexcept {
+        ++_stats.shadowed_rows_skipped;
+    }
+    inline void on_shadowed_range_row_skip() noexcept {
+        ++_stats.shadowed_range_rows_skipped;
+    }
+    inline void on_shadowed_jump(uint64_t bytes) noexcept {
+        ++_stats.shadowed_jumps;
+        _stats.shadowed_bytes_jumped += bytes;
     }
 };
 

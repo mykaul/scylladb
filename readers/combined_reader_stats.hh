@@ -17,4 +17,6 @@ struct combined_reader_statistics {
     // number of sstable files (index). The length of the vector is equal
     // to the number of compacted sstables + 1
     std::vector<int64_t> rows_merged_histogram;
+    // Set by compaction: let inputs drop data shadowed by another input's tombstones.
+    bool skip_shadowed = false;
 };

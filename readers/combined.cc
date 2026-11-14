@@ -234,7 +234,29 @@ private:
     const schema_ptr _schema;
     streamed_mutation::forwarding _fwd_sm;
     mutation_reader::forwarding _fwd_mr;
+    // Merged partition tombstone of the partition_start batch just emitted.
+    tombstone _shadow_tomb;
+    // Shadowed-data skipping (compaction only), null when disabled. Heap-allocated so
+    // readers can keep a pointer across moves of the merger.
+    std::unique_ptr<shadowed_range_hint> _hint;
+    // Range tombstone currently open in each stream of the current partition.
+    merger_vector<std::pair<stream_id_t, tombstone>> _open_rts;
+    stream_id_t _hint_holder = nullptr;
 private:
+    void track_shadow(const mutation_fragment_v2& mf, stream_id_t stream);
+    void reset_shadow_state() {
+        _shadow_tomb = {};
+        _open_rts.clear();
+        _hint_holder = nullptr;
+        if (_hint) {
+            _hint->active = false;
+        }
+    }
+    void note_head(stream_id_t stream, position_in_partition_view pos) {
+        if (_hint && _hint->active && stream == _hint_holder) {
+            _hint->end = position_in_partition(pos);
+        }
+    }
     future<mutation_fragment_batch_opt> maybe_produce_batch();
     void maybe_add_readers_at_partition_boundary();
     void maybe_add_readers(const std::optional<dht::ring_position_view>& pos);
@@ -250,7 +272,8 @@ public:
     mutation_reader_merger(schema_ptr schema,
             std::unique_ptr<reader_selector> selector,
             streamed_mutation::forwarding fwd_sm,
-            mutation_reader::forwarding fwd_mr);
+            mutation_reader::forwarding fwd_mr,
+            combined_reader_statistics* skip_stats = nullptr);
     // Produces the next batch of mutation-fragments of the same
     // position.
     future<mutation_fragment_batch> operator()();
@@ -325,6 +348,9 @@ void mutation_reader_merger::maybe_add_readers(const std::optional<dht::ring_pos
 
 void mutation_reader_merger::add_readers(std::vector<mutation_reader> new_readers) {
     for (auto&& new_reader : new_readers) {
+        if (_hint) {
+            new_reader.set_shadowed_range_hint(_hint.get());
+        }
         _all_readers.emplace_back(std::move(new_reader));
         _next.emplace_back(std::prev(_all_readers.end()), mutation_fragment_v2::kind::partition_end);
     }
@@ -380,7 +406,44 @@ future<mutation_reader_merger::needs_merge> mutation_reader_merger::advance_gall
     });
 }
 
+// Readers only drop rows they parse after the hint was published, and they parse ahead of
+// the merge position, so a covered row is always after the tombstone start.
+void mutation_reader_merger::track_shadow(const mutation_fragment_v2& mf, stream_id_t stream) {
+    if (!mf.is_range_tombstone_change()) {
+        return;
+    }
+    auto t = mf.as_range_tombstone_change().tombstone();
+    auto it = std::ranges::find(_open_rts, stream, &std::pair<stream_id_t, tombstone>::first);
+    if (it == _open_rts.end()) {
+        _open_rts.emplace_back(stream, t);
+    } else {
+        it->second = t;
+    }
+    // The hint follows the newest open range tombstone, up to its stream's next fragment.
+    auto holder = _hint_holder;
+    _hint_holder = nullptr;
+    tombstone best;
+    for (auto& [s, ot] : _open_rts) {
+        if (ot && ot > best) {
+            best = ot;
+            _hint_holder = s;
+        }
+    }
+    _hint->active = bool(best);
+    _hint->tomb = best;
+    if (_hint_holder != holder) {
+        _hint->end = position_in_partition(mf.position());
+    }
+}
+
 future<> mutation_reader_merger::prepare_next() {
+    if (auto t = std::exchange(_shadow_tomb, tombstone())) {
+        for (auto& rk : _next) {
+            if (rk.last_kind == mutation_fragment_v2::kind::partition_start) {
+                rk.reader->skip_shadowed_partition(t);
+            }
+        }
+    }
     return parallel_for_each(_next, [this] (reader_and_last_fragment_kind rk) {
         return prepare_one(rk, reader_galloping::no).discard_result();
     }).then([this] {
@@ -401,6 +464,10 @@ future<mutation_reader_merger::needs_merge> mutation_reader_merger::prepare_one(
                     // Optimization: assume that galloping reader will keep winning, and compare directly with the heap front.
                     // If this assumption is correct, we do one key comparison instead of pushing to/popping from the heap.
                     if (_fragment_heap.empty() || position_in_partition::less_compare(*_schema)(mfo->position(), _fragment_heap.front().fragment.position())) {
+                        if (_hint) {
+                            track_shadow(*mfo, &*_galloping_reader.reader);
+                            note_head(&*_galloping_reader.reader, mfo->position());
+                        }
                         _current.clear();
                         _current.emplace_back(std::move(*mfo), &*_galloping_reader.reader);
                         _galloping_reader.last_kind = _current.back().fragment.mutation_fragment_kind();
@@ -410,6 +477,9 @@ future<mutation_reader_merger::needs_merge> mutation_reader_merger::prepare_one(
                     _gallop_mode_hits = 0;
                 }
 
+                if (_hint) {
+                    note_head(&*rk.reader, mfo->position());
+                }
                 _fragment_heap.emplace_back(rk.reader, std::move(*mfo));
                 std::ranges::push_heap(_fragment_heap, fragment_heap_compare(*_schema));
             }
@@ -475,11 +545,13 @@ void mutation_reader_merger::prepare_forwardable_readers() {
 mutation_reader_merger::mutation_reader_merger(schema_ptr schema,
         std::unique_ptr<reader_selector> selector,
         streamed_mutation::forwarding fwd_sm,
-        mutation_reader::forwarding fwd_mr)
+        mutation_reader::forwarding fwd_mr,
+        combined_reader_statistics* skip_stats)
     : _selector(std::move(selector))
     , _schema(std::move(schema))
     , _fwd_sm(fwd_sm)
-    , _fwd_mr(fwd_mr) {
+    , _fwd_mr(fwd_mr)
+    , _hint(skip_stats && fwd_sm == streamed_mutation::forwarding::no ? std::make_unique<shadowed_range_hint>() : nullptr) {
     maybe_add_readers(std::nullopt);
 }
 
@@ -545,6 +617,15 @@ future<mutation_fragment_batch_opt> mutation_reader_merger::maybe_produce_batch(
             _reader_heap.pop_back();
         }
         while (!_reader_heap.empty() && key(_fragment_heap).equal(*_schema, key(_reader_heap)));
+        if (_hint) {
+            reset_shadow_state();
+            if (_fragment_heap.size() > 1) {
+                _hint->key = key(_fragment_heap);
+                for (auto& rf : _fragment_heap) {
+                    _shadow_tomb.apply(rf.fragment.as_partition_start().partition_tombstone());
+                }
+            }
+        }
         if (_fragment_heap.size() == 1) {
             _single_reader = { _fragment_heap.back().reader, mutation_fragment_v2::kind::partition_start };
             _current.emplace_back(std::move(_fragment_heap.back().fragment), &*_single_reader.reader);
@@ -558,6 +639,9 @@ future<mutation_fragment_batch_opt> mutation_reader_merger::maybe_produce_batch(
     do {
         std::ranges::pop_heap(_fragment_heap, fragment_heap_compare(*_schema));
         auto& n = _fragment_heap.back();
+        if (_hint) {
+            track_shadow(n.fragment, &*n.reader);
+        }
         const auto kind = n.fragment.mutation_fragment_kind();
         _current.emplace_back(std::move(n.fragment), &*n.reader);
         _next.emplace_back(n.reader, kind);
@@ -580,6 +664,7 @@ future<mutation_fragment_batch_opt> mutation_reader_merger::maybe_produce_batch(
 }
 
 future<> mutation_reader_merger::next_partition() {
+    reset_shadow_state();
     // If the last batch of fragments returned by operator() came from partition P,
     // we must forward to the partition immediately following P (as per the `next_partition`
     // contract in `mutation_reader`).
@@ -600,6 +685,7 @@ future<> mutation_reader_merger::next_partition() {
 }
 
 future<> mutation_reader_merger::fast_forward_to(const dht::partition_range& pr) {
+    reset_shadow_state();
     _single_reader = { };
     _gallop_mode_hits = 0;
     _next.clear();
@@ -618,6 +704,7 @@ future<> mutation_reader_merger::fast_forward_to(const dht::partition_range& pr)
 }
 
 future<> mutation_reader_merger::fast_forward_to(position_range pr) {
+    reset_shadow_state();
     prepare_forwardable_readers();
     return parallel_for_each(_next, [pr = std::move(pr)] (reader_and_last_fragment_kind rk) {
         return rk.reader->fast_forward_to(pr);
@@ -705,7 +792,9 @@ mutation_reader make_combined_reader(schema_ptr schema,
     return make_mutation_reader<merging_reader<mutation_reader_merger>>(schema,
             std::move(permit),
             fwd_sm,
-            mutation_reader_merger(schema, std::move(selector), fwd_sm, fwd_mr),
+            // Multi-range reads wrap sstable readers in wrappers that ignore the skip, so don't track shadowing there.
+            mutation_reader_merger(schema, std::move(selector), fwd_sm, fwd_mr,
+                    statistics && statistics->skip_shadowed && fwd_mr == mutation_reader::forwarding::no ? statistics : nullptr),
             statistics);
 }
 

@@ -901,6 +901,8 @@ db::config::config(std::shared_ptr<db::extensions> exts)
         "Log a warning when writing a collection containing more elements than this value.")
     , compaction_large_data_records_per_sstable(this, "compaction_large_data_records_per_sstable", liveness::LiveUpdate, value_status::Used, 10,
         "Maximum number of large data records per type to store in each SSTable's scylla metadata.")
+    , compaction_skip_shadowed_data(this, "compaction_skip_shadowed_data", liveness::LiveUpdate, value_status::Used, false,
+        "Let compaction skip reading data that a newer partition or range tombstone in another input provably deletes. Relies on the max timestamp stored in each SSTable. Large shadowed partitions are jumped over using the partition index. Skipped data is not covered by the input's whole-file digest check; per-chunk checksums still are.")
     /**
     * @Group Common memtable settings
     */

@@ -46,6 +46,20 @@ future<> test_compaction(sharded<perf_sstable_test_env>& dt) {
                 std::cout << format("compaction: {:.1f} instructions / partition, {:.2f} allocations / partition\n",
                         double(t[0]) / t[2], double(t[1]) / t[2]);
             });
+        }).then([&dt] {
+            return dt.map_reduce0([] (perf_sstable_test_env&) {
+                const auto& st = sstables::sstables_stats::get_shard_stats();
+                return std::array<uint64_t, 7>{st.shadowed_partitions_skipped, st.shadowed_rows_skipped, st.shadowed_range_rows_skipped,
+                        st.shadowed_jumps, st.shadowed_bytes_jumped, compaction_read_bytes, compaction_read_ahead_discarded_bytes};
+            }, std::array<uint64_t, 7>{}, [] (auto a, auto b) {
+                for (size_t i = 0; i < a.size(); ++i) {
+                    a[i] += b[i];
+                }
+                return a;
+            }).then([] (auto t) {
+                std::cout << format("shadowed: {} partitions, {} rows, {} range rows, {} jumps, {} bytes jumped; read {} bytes, {} read-ahead bytes discarded\n",
+                        t[0], t[1], t[2], t[3], t[4], t[5], t[6]);
+            });
         }).get();
     });
 }
@@ -127,6 +141,9 @@ int scylla_sstable_main(int argc, char** argv) {
         ("rows-per-partition", bpo::value<unsigned>()->default_value(0), "clustering rows per partition; 0 means a single row without a clustering key")
         ("overlap-percent", bpo::value<unsigned>()->default_value(100), "compaction mode: percent of keys shared by all input sstables")
         ("compressible", bpo::bool_switch(), "use cell values LZ4 compresses about 2.6x")
+        ("delete-percent", bpo::value<unsigned>()->default_value(0), "compaction mode: the newest input deletes this percent of the shared keys")
+        ("delete-rows", bpo::value<unsigned>()->default_value(0), "with --delete-percent: range-delete the first N rows instead of the partition")
+        ("skip-shadowed", bpo::bool_switch(), "enable compaction_skip_shadowed_data")
         ("timestamp-range", bpo::value<api::timestamp_type>()->default_value(0), "Timestamp values to use, chosen uniformly from: [-x, +x]");
 
     return app.run(argc, argv, [&app] {
@@ -158,6 +175,15 @@ int scylla_sstable_main(int argc, char** argv) {
             }
             cfg.compressible = app.configuration()["compressible"].as<bool>();
             cfg.rows_per_partition = app.configuration()["rows-per-partition"].as<unsigned>();
+            cfg.delete_percent = app.configuration()["delete-percent"].as<unsigned>();
+            cfg.delete_rows = app.configuration()["delete-rows"].as<unsigned>();
+            if (cfg.delete_percent > 100) {
+                throw std::invalid_argument("--delete-percent must be at most 100");
+            }
+            if (cfg.delete_rows && !cfg.rows_per_partition) {
+                throw std::invalid_argument("--delete-rows requires --rows-per-partition");
+            }
+            cfg.skip_shadowed = app.configuration()["skip-shadowed"].as<bool>();
             auto scf = make_sstable_compressor_factory_for_tests_in_thread();
             test.start(std::move(cfg), std::ref(*scf)).get();
             auto stop_test = deferred_stop(test);

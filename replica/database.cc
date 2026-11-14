@@ -399,6 +399,7 @@ static auto configure_sstables_manager(const db::config& cfg, const database_con
         .large_data_records_per_sstable = cfg.compaction_large_data_records_per_sstable,
         .ignore_component_digest_mismatch = cfg.ignore_component_digest_mismatch(),
         .enable_dangerous_direct_import_of_cassandra_counters = cfg.enable_dangerous_direct_import_of_cassandra_counters(),
+        .compaction_skip_shadowed_data = cfg.compaction_skip_shadowed_data,
     };
 }
 

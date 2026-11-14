@@ -16,6 +16,7 @@
 #include "sstables/processing_result_generator.hh"
 #include "utils/to_string.hh"
 #include "utils/value_or_reference.hh"
+#include "build_mode.hh"
 
 namespace sstables {
 namespace mx {
@@ -34,6 +35,8 @@ public:
     }
 
     virtual data_consumer::proceed on_next_partition(dht::decorated_key, tombstone);
+    // Called per row walked in a shadowed partition; true asks for an index jump past it.
+    virtual bool on_shadowed_row_walked() { return false; }
 };
 
 enum class row_processing_result {
@@ -76,8 +79,31 @@ public:
     std::vector<cell> _cells;
     std::optional<collection_mutation_writer> _cm;
 
+    // Shadowed-data skipping (compaction): the rest of the current partition is dropped.
+    bool _dropping = false;
+    // Range tombstone open in the dropped part, tracked so malformed markers are still rejected.
+    tombstone _dropped_rt;
+    const shadowed_range_hint* _range_hint = nullptr;
+    const api::timestamp_type _max_timestamp;
+
+    row_processing_result drop_row() {
+        if (need_preempt() || _reader->on_shadowed_row_walked()) {
+            return row_processing_result::retry_later;
+        }
+        _sst->get_stats().on_shadowed_row_skip();
+        return row_processing_result::skip_row;
+    }
+
+    bool covered_by_range_hint(position_in_partition_view pos) const {
+        return _range_hint->tomb.timestamp > _max_timestamp
+                && _range_hint->key && _reader->_current_partition_key
+                && _range_hint->key->equal(*_schema, *_reader->_current_partition_key)
+                && position_in_partition::less_compare(*_schema)(pos, _range_hint->end);
+    }
+
     data_consumer::proceed consume_range_tombstone_start(clustering_key_prefix ck, bound_kind k, tombstone t) {
         sstlog.trace("mp_row_consumer_m {}: consume_range_tombstone_start(ck={}, k={}, t={})", fmt::ptr(this), ck, k, t);
+        check_max_timestamp(t.timestamp);
         if (_mf_filter->current_tombstone()) {
             throw_malformed_sstable_exception(
                     format("Range tombstones have to be disjoint: current opened range tombstone {}, new tombstone {}",
@@ -105,6 +131,7 @@ public:
 
     data_consumer::proceed consume_range_tombstone_boundary(position_in_partition pos, tombstone left, tombstone right) {
         sstlog.trace("mp_row_consumer_m {}: consume_range_tombstone_boundary(pos={}, left={}, right={})", fmt::ptr(this), pos, left, right);
+        check_max_timestamp(right.timestamp);
         if (!_mf_filter->current_tombstone()) {
             throw_malformed_sstable_exception(
                     format("Closing range tombstone that wasn't opened: pos {}, tombstone {}", pos, left));
@@ -158,6 +185,8 @@ public:
     }
 
     inline void reset_for_new_partition() {
+        _dropping = false;
+        _dropped_rt = {};
         _is_mutation_end = true;
         _in_progress_row.reset();
         _stored_tombstone.reset();
@@ -202,6 +231,7 @@ public:
         , _fwd(fwd)
         , _treat_static_row_as_regular(_schema->is_static_compact_table()
             && (!sst->has_scylla_component() || sst->features().is_enabled(sstable_feature::CorrectStaticCompact))) // See #4139
+        , _max_timestamp(sst->get_stats_metadata().max_timestamp)
     {
         _cells.reserve(std::max(_schema->static_columns_count(), _schema->regular_columns_count()));
     }
@@ -234,6 +264,27 @@ public:
 
     bool is_mutation_end() const {
         return _is_mutation_end;
+    }
+
+    // Shadowed-data skipping trusts max_timestamp as an upper bound; non-release builds verify it on every read.
+    void check_max_timestamp([[maybe_unused]] api::timestamp_type ts) const {
+#ifndef SCYLLA_BUILD_MODE_RELEASE
+        if (ts > _max_timestamp && _sst->has_scylla_component()) [[unlikely]] {
+            on_internal_error(sstlog, format("{}: timestamp {} exceeds max_timestamp {} in stats", _sst->get_filename(), ts, _max_timestamp));
+        }
+#endif
+    }
+
+    // Only stats written by Scylla are trusted as a proof that data is shadowed.
+    bool can_skip_shadowed(api::timestamp_type ts) const {
+        return ts > _max_timestamp && _sst->has_scylla_component();
+    }
+    void start_dropping() {
+        _dropping = true;
+        _dropped_rt = _mf_filter ? _mf_filter->current_tombstone() : tombstone();
+    }
+    void set_range_hint(const shadowed_range_hint* h) {
+        _range_hint = _sst->has_scylla_component() ? h : nullptr;
     }
 
     void setup_for_partition(const partition_key& pk) {
@@ -298,6 +349,7 @@ public:
         auto pk = key.to_partition_key(*_schema);
         setup_for_partition(pk);
         auto dk = dht::decorate_key(*_schema, pk);
+        check_max_timestamp(tombstone(deltime).timestamp);
 
         auto should_proceed = _reader->on_next_partition(std::move(dk), tombstone(deltime));
         if (should_proceed == data_consumer::proceed::no) {
@@ -307,6 +359,9 @@ public:
     }
 
     row_processing_result consume_row_start(const std::vector<fragmented_temporary_buffer>& ecp) {
+        if (_dropping) [[unlikely]] {
+            return drop_row();
+        }
         auto key = clustering_key_prefix::from_range(ecp | std::views::transform(
             [] (const fragmented_temporary_buffer& b) { return fragmented_temporary_buffer::view(b); }));
 
@@ -325,6 +380,11 @@ public:
         switch (res.action) {
         case mutation_fragment_filter::result::emit:
             sstlog.trace("mp_row_consumer_m {}: emit", fmt::ptr(this));
+            if (_range_hint && _range_hint->active && covered_by_range_hint(_in_progress_row->position())) [[unlikely]] {
+                _sst->get_stats().on_shadowed_range_row_skip();
+                _in_progress_row.reset();
+                return row_processing_result::skip_row;
+            }
             return row_processing_result::do_proceed;
         case mutation_fragment_filter::result::ignore:
             sstlog.trace("mp_row_consumer_m {}: ignore", fmt::ptr(this));
@@ -354,6 +414,7 @@ public:
             const liveness_info& info, tombstone tomb, tombstone shadowable_tomb) {
         sstlog.trace("mp_row_consumer_m {}: consume_row_marker_and_tombstone({}, {}, {}), key={}",
             fmt::ptr(this), info.to_row_marker(), tomb, shadowable_tomb, _in_progress_row->position());
+        check_max_timestamp(std::max({info.to_row_marker().timestamp(), tomb.timestamp, shadowable_tomb.timestamp}));
         _in_progress_row->apply(info.to_row_marker());
         _in_progress_row->apply(tomb);
         if (shadowable_tomb) {
@@ -370,6 +431,9 @@ public:
         if (_treat_static_row_as_regular) {
             return consume_row_start({});
         }
+        if (_dropping) [[unlikely]] {
+            return drop_row();
+        }
         _inside_static_row = true;
         _in_progress_static_row = static_row();
         return row_processing_result::do_proceed;
@@ -385,6 +449,7 @@ public:
         const std::optional<column_id>& column_id = column_info.id;
         sstlog.trace("mp_row_consumer_m {}: consume_column(id={}, path={}, value={}, ts={}, ttl={}, del_time={}, deleted={})", fmt::ptr(this),
             column_id, fmt_hex(cell_path), value, timestamp, ttl.count(), local_deletion_time.time_since_epoch().count(), is_deleted);
+        check_max_timestamp(timestamp);
         check_column_missing_in_current_schema(column_info, timestamp);
         if (!column_id) {
             return data_consumer::proceed::yes;
@@ -435,6 +500,7 @@ public:
     data_consumer::proceed consume_complex_column_start(const sstables::column_translation::column_info& column_info,
                                                  tombstone tomb) {
         sstlog.trace("mp_row_consumer_m {}: consume_complex_column_start({}, {})", fmt::ptr(this), column_info.id, tomb);
+        check_max_timestamp(tomb.timestamp);
         _cm.emplace(tomb);
         return data_consumer::proceed::yes;
     }
@@ -461,6 +527,7 @@ public:
                                            api::timestamp_type timestamp) {
         const std::optional<column_id>& column_id = column_info.id;
         sstlog.trace("mp_row_consumer_m {}: consume_counter_column({}, {}, {})", fmt::ptr(this), column_id, value, timestamp);
+        check_max_timestamp(timestamp);
         check_column_missing_in_current_schema(column_info, timestamp);
         if (!column_id) {
             return data_consumer::proceed::yes;
@@ -478,6 +545,16 @@ public:
     data_consumer::proceed consume_range_tombstone(const std::vector<fragmented_temporary_buffer>& ecp,
                                             bound_kind kind,
                                             tombstone tomb) {
+        if (_dropping) [[unlikely]] {
+            // Same marker checks as consume_range_tombstone_start/end.
+            check_max_timestamp(tomb.timestamp);
+            const bool start = kind == bound_kind::incl_start || kind == bound_kind::excl_start;
+            if (start ? bool(_dropped_rt) : _dropped_rt != tomb || !tomb) {
+                throw_malformed_sstable_exception(format("Mismatched range tombstone marker in a dropped partition: open {}, marker {}", _dropped_rt, tomb));
+            }
+            _dropped_rt = start ? tomb : tombstone();
+            return data_consumer::proceed(!need_preempt());
+        }
         auto ck = clustering_key_prefix::from_range(ecp | std::views::transform(
             [] (const fragmented_temporary_buffer& b) { return fragmented_temporary_buffer::view(b); }));
         if (kind == bound_kind::incl_start || kind == bound_kind::excl_start) {
@@ -491,6 +568,15 @@ public:
                                             sstables::bound_kind_m kind,
                                             tombstone end_tombstone,
                                             tombstone start_tombstone) {
+        if (_dropping) [[unlikely]] {
+            // A boundary closes one range tombstone and opens the next.
+            check_max_timestamp(start_tombstone.timestamp);
+            if (!_dropped_rt || _dropped_rt != end_tombstone) {
+                throw_malformed_sstable_exception(format("Mismatched range tombstone boundary in a dropped partition: open {}, boundary {}", _dropped_rt, end_tombstone));
+            }
+            _dropped_rt = start_tombstone;
+            return data_consumer::proceed(!need_preempt());
+        }
         auto ck = clustering_key_prefix::from_range(ecp | std::views::transform(
             [] (const fragmented_temporary_buffer& b) { return fragmented_temporary_buffer::view(b); }));
         switch (kind) {
@@ -555,7 +641,10 @@ public:
 
     void on_end_of_stream() {
         sstlog.trace("mp_row_consumer_m {}: on_end_of_stream()", fmt::ptr(this));
-        if (_mf_filter && _mf_filter->current_tombstone()) {
+        if (_dropping && _dropped_rt) {
+            throw_malformed_sstable_exception("Unclosed range tombstone.");
+        }
+        if (_mf_filter && _mf_filter->current_tombstone() && !_dropping) {
             if (_mf_filter->out_of_range()) {
                 throw_malformed_sstable_exception("Unclosed range tombstone.");
             }
@@ -1276,6 +1365,35 @@ class mx_sstable_mutation_reader : public mp_row_consumer_reader_mx {
     // of the reversing data source used underneath (see `partition_reversing_data_source`).
     // Engaged after `_context` is engaged, i.e. after `initialize()`.
     const uint64_t* _reversed_read_sstable_position;
+
+    // Shadowed-partition walk: data position where it started, and the walked
+    // bytes after which one index lookup jumps to the partition end (0: not computed yet).
+    uint64_t _shadow_walk_start = 0;
+    uint64_t _shadow_jump_threshold = 0;
+    bool _shadow_jump_requested = false;
+
+    static constexpr uint64_t no_shadow_jump = std::numeric_limits<uint64_t>::max();
+
+    // Picks the lookup threshold from the index/data ratio and the partition size histogram.
+    uint64_t initial_shadow_jump_threshold() const {
+        constexpr uint64_t base = 256 * 1024;
+        const auto& hist = _sst->get_stats_metadata().estimated_partition_size;
+        double total = 0, tail = 0;
+        for (size_t i = 0; i < hist.bucket_offsets.size() && i < hist.buckets.size(); ++i) {
+            double bytes = double(hist.buckets[i]) * hist.bucket_offsets[i];
+            total += bytes;
+            if (uint64_t(hist.bucket_offsets[i]) >= base) {
+                tail += bytes;
+            }
+        }
+        if (total == 0 || tail / total < 0.01) {
+            // No large partitions: a lookup would almost never pay off.
+            return no_shadow_jump;
+        }
+        const auto data = std::max<uint64_t>(_sst->ondisk_data_size(), 1);
+        const auto index = _sst->index_size() + _sst->partitions_size() + _sst->rows_size();
+        return double(index) / data > 0.2 ? 4 * base : base;
+    }
 public:
     mx_sstable_mutation_reader(shared_sstable sst,
                             schema_ptr schema,
@@ -1340,6 +1458,7 @@ private:
     }
     future<> advance_to_next_partition() {
         sstlog.trace("reader {}: advance_to_next_partition()", fmt::ptr(this));
+        const bool shadow_jump = std::exchange(_shadow_jump_requested, false);
         _before_partition = true;
         auto& consumer = _consumer;
         if (consumer.is_mutation_end()) {
@@ -1350,9 +1469,18 @@ private:
         return (_index_in_current_partition
                 ? _index_reader->advance_to_next_partition()
                 : get_index_reader().advance_past_definitely_present_partition(*_current_partition_key))
-        .then([this] {
+        .then([this, shadow_jump] {
             _index_in_current_partition = true;
             auto [start, end] = _index_reader->data_file_positions();
+            if (shadow_jump) {
+                const auto pos = _context->position();
+                const auto saved = start > pos ? start - pos : 0;
+                _sst->get_stats().on_shadowed_jump(saved);
+                // Lookups that save little get rarer for this input.
+                if (saved < _shadow_jump_threshold) {
+                    _shadow_jump_threshold = std::min<uint64_t>(_shadow_jump_threshold * 2, 8 << 20);
+                }
+            }
             if (end && start > *end) {
                 _read_enabled = false;
                 return make_ready_future<>();
@@ -1770,6 +1898,39 @@ public:
             return make_exception_future<>(maybe_attribute_malformed_sstable_exception(std::move(ep), _sst->generation(),
                     format("Failed to read partition from SSTable {}", _sst->get_filename())));
         });
+    }
+    virtual void skip_shadowed_partition(tombstone t) override {
+        if (_fwd || reversed() || !is_initialized() || !_consumer.can_skip_shadowed(t.timestamp)) {
+            return;
+        }
+        // Keep a buffered partition_end instead of allocating a new one: small partitions are usually fully buffered.
+        while (!is_buffer_empty() && !buffer().front().is_end_of_partition()) {
+            pop_mutation_fragment();
+        }
+        // A finished partition always leaves its partition_end buffered, so an empty buffer means the parser is still inside it.
+        if (is_buffer_empty() && !_partition_finished) {
+            // Walk the rest without materializing it.
+            _consumer.start_dropping();
+            _shadow_walk_start = _context->position();
+        }
+        // Skipped bytes leave the whole-file digest unchecked; per-chunk checksums still cover every chunk read.
+        _sst->get_stats().on_shadowed_partition_skip();
+    }
+    virtual void set_shadowed_range_hint(const shadowed_range_hint* h) noexcept override {
+        _consumer.set_range_hint(h);
+    }
+    virtual bool on_shadowed_row_walked() override {
+        if (!_shadow_jump_threshold) {
+            _shadow_jump_threshold = initial_shadow_jump_threshold();
+        }
+        if (_shadow_jump_threshold == no_shadow_jump || _context->position() - _shadow_walk_start < _shadow_jump_threshold) {
+            return false;
+        }
+        // Finish the partition; the next fill jumps past its end via the index.
+        _shadow_jump_requested = true;
+        push_mutation_fragment(mutation_fragment_v2(*_schema, _permit, partition_end()));
+        _partition_finished = true;
+        return true;
     }
     virtual future<> next_partition() override {
         if (is_initialized()) {

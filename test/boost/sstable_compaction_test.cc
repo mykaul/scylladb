@@ -43,6 +43,7 @@
 #include "compaction/size_tiered_backlog_tracker.hh"
 #include "test/lib/mutation_assertions.hh"
 #include "test/lib/simple_schema.hh"
+#include "test/lib/mutation_source_test.hh"
 #include "test/lib/mutation_reader_assertions.hh"
 #include "test/lib/sstable_run_based_compaction_strategy_for_tests.hh"
 #include "test/lib/random_schema.hh"
@@ -7571,6 +7572,423 @@ SEASTAR_TEST_CASE(test_compaction_output_is_not_leaked_when_attach_fails) {
         auto expected = before;
         std::erase(expected, new_sstable_toc);
         BOOST_REQUIRE_EQUAL(after, expected);
+    });
+}
+
+using make_descriptor_fn = std::function<compaction::compaction_descriptor(std::vector<shared_sstable>)>;
+
+static compaction::compaction_descriptor make_regular_descriptor(std::vector<shared_sstable> ssts) {
+    return compaction::compaction_descriptor(std::move(ssts));
+}
+
+static std::vector<mutation> compact_and_read(
+        test_env& env, table_for_tests& cf, schema_ptr s, std::function<std::vector<shared_sstable>()> make_inputs, bool skip,
+        make_descriptor_fn make_desc = make_regular_descriptor) {
+    env.db_config().compaction_skip_shadowed_data.set(bool(skip));
+    auto reset_skip = defer([&] noexcept {
+        env.db_config().compaction_skip_shadowed_data.set(false);
+    });
+    std::vector<shared_sstable> out;
+    auto creator = [&] {
+        auto sst = env.make_sstable(s);
+        out.push_back(sst);
+        return sst;
+    };
+    compact_sstables(env, make_desc(make_inputs()), cf, creator).get();
+    std::vector<mutation> result;
+    for (auto& sst : out) {
+        auto rd = sstable_reader(env.reusable_sst(s, sst).get(), s, env.make_reader_permit());
+        auto close_rd = deferred_close(rd);
+        while (auto m = read_mutation_from_mutation_reader(rd).get()) {
+            result.push_back(std::move(*m));
+        }
+    }
+    // Split compaction spreads partitions over several outputs.
+    std::ranges::stable_sort(result, [&] (const mutation& a, const mutation& b) {
+        return a.decorated_key().less_compare(*s, b.decorated_key());
+    });
+    return result;
+}
+
+// Compacting with skipping on must produce exactly what compacting without it does.
+static void check_skip_shadowed_data_output(test_env& env, table_for_tests& cf, schema_ptr s, std::function<std::vector<shared_sstable>()> make_inputs,
+        make_descriptor_fn make_desc = make_regular_descriptor) {
+    const auto& stats = sstables::sstables_stats::get_shard_stats();
+    const auto skipped = [&] {
+        return std::tuple(stats.shadowed_partitions_skipped, stats.shadowed_rows_skipped, stats.shadowed_range_rows_skipped, stats.shadowed_jumps);
+    };
+    const auto before = skipped();
+    auto expected = compact_and_read(env, cf, s, make_inputs, false, make_desc);
+    // Callers measure skipping across both runs; the reference run must not skip anything.
+    BOOST_REQUIRE(skipped() == before);
+    auto actual = compact_and_read(env, cf, s, make_inputs, true, make_desc);
+    BOOST_REQUIRE_EQUAL(actual.size(), expected.size());
+    for (size_t i = 0; i < expected.size(); ++i) {
+        assert_that(actual[i]).is_equal_to(expected[i]);
+    }
+}
+
+// Inputs have ordered timestamps and the newest one deletes partitions and row ranges.
+// Skipping data shadowed by those tombstones must not change the compaction output.
+static void test_skip_shadowed_data(test_env& env, unsigned rows, bool purgeable) {
+    simple_schema ss;
+    auto s = schema_builder(ss.schema()).set_gc_grace_seconds(purgeable ? 0 : 864000).build();
+    ss.set_schema(s);
+    auto cf = env.make_table_for_tests(s);
+    auto close_cf = deferred_stop(cf);
+    const unsigned partitions = 16;
+    const sstring value(200, 'v');
+    // Deletions in the past so purgeable tombstones are really purged.
+    const auto deletion_time = gc_clock::now() - std::chrono::hours(1);
+
+    auto make_inputs = [&] {
+        std::vector<shared_sstable> ssts;
+        for (api::timestamp_type base : {1000, 2000}) {
+            utils::chunked_vector<mutation> muts;
+            for (unsigned p = 0; p < partitions; ++p) {
+                mutation m(s, ss.make_pkey(p));
+                ss.add_static_row(m, "static", base);
+                for (unsigned r = base == 1000 ? 0 : rows / 3; r < rows; ++r) {
+                    ss.add_row(m, ss.make_ckey(r), value, base + r % 7);
+                }
+                m.partition().clustered_row(*s, ss.make_ckey(rows / 2)).apply(tombstone(base + 8, deletion_time));
+                ss.delete_range(m, ss.make_ckey_range(rows / 4, rows / 4 + 3), tombstone(base + 9, deletion_time));
+                muts.push_back(std::move(m));
+            }
+            ssts.push_back(make_sstable_containing(env.make_sst_factory(s), std::move(muts)).get());
+        }
+        // Newest input: kind of deletion depends on the partition.
+        utils::chunked_vector<mutation> muts;
+        for (unsigned p = 0; p < partitions; ++p) {
+            mutation m(s, ss.make_pkey(p));
+            switch (p % 5) {
+            case 0: m.partition().apply(tombstone(5000, deletion_time)); break;
+            // Equal to the newest older input's max timestamp: must not skip that input.
+            case 1: m.partition().apply(tombstone(2000 + 9, deletion_time)); break;
+            case 2: ss.delete_range(m, ss.make_ckey_range(0, rows * 3 / 4), tombstone(5000, deletion_time)); break;
+            case 3: ss.add_row(m, ss.make_ckey(1), value, 5000); break;
+            case 4: ss.delete_range(m, ss.make_ckey_range(rows / 3, rows / 2), tombstone(5000, deletion_time));
+                    ss.add_row(m, ss.make_ckey(rows / 3 + 1), value, 6000); break;
+            }
+            muts.push_back(std::move(m));
+        }
+        ssts.push_back(make_sstable_containing(env.make_sst_factory(s), std::move(muts)).get());
+        return ssts;
+    };
+
+    const auto before = sstables::sstables_stats::get_shard_stats();
+    check_skip_shadowed_data_output(env, cf, s, make_inputs);
+    const auto& after = sstables::sstables_stats::get_shard_stats();
+    // Two older inputs for case 0, one for case 1 (strict comparison).
+    BOOST_REQUIRE_EQUAL(after.shadowed_partitions_skipped - before.shadowed_partitions_skipped, 2 * ((partitions + 4) / 5) + (partitions + 3) / 5);
+    // Small partitions are already parsed into the reader buffer when the merger sees the tombstone.
+    if (rows >= 2000) {
+        BOOST_REQUIRE_GT(after.shadowed_range_rows_skipped, before.shadowed_range_rows_skipped);
+        BOOST_REQUIRE_GT(after.shadowed_jumps, before.shadowed_jumps);
+    }
+}
+
+SEASTAR_TEST_CASE(compaction_skip_shadowed_data_small_partitions) {
+    return test_env::do_with_async([] (test_env& env) {
+        test_skip_shadowed_data(env, 40, false);
+        test_skip_shadowed_data(env, 40, true);
+    });
+}
+
+SEASTAR_TEST_CASE(compaction_skip_shadowed_data_large_partitions) {
+    return test_env::do_with_async([] (test_env& env) {
+        test_skip_shadowed_data(env, 3000, false);
+        test_skip_shadowed_data(env, 3000, true);
+    });
+}
+
+// Random inputs with overlapping timestamp bands, partially overlapping keys and random deletions.
+static void test_skip_shadowed_data_random(test_env& env, uint32_t seed) {
+    std::mt19937 rng(seed);
+    auto rand = [&](uint32_t n) {
+        return uint32_t(rng() % n);
+    };
+    simple_schema ss;
+    auto s = schema_builder(ss.schema()).set_gc_grace_seconds(rand(2) ? 0 : 864000).build();
+    ss.set_schema(s);
+    auto cf = env.make_table_for_tests(s);
+    auto close_cf = deferred_stop(cf);
+    const auto deletion_time = gc_clock::now() - std::chrono::hours(1);
+    const unsigned inputs = 2 + rand(4);
+    const uint32_t input_seed = rng();
+
+    auto make_inputs = [&] {
+        std::mt19937 rng(input_seed);
+        auto rand = [&](uint32_t n) {
+            return uint32_t(rng() % n);
+        };
+        std::vector<shared_sstable> ssts;
+        for (unsigned i = 0; i < inputs; ++i) {
+            // Mostly newer bands per input, sometimes overlapping the previous ones.
+            const api::timestamp_type base = 1000 * (i + 1) - (rand(4) ? 0 : 500 + rand(1000));
+            utils::chunked_vector<mutation> muts;
+            for (unsigned p = 0; p < 12; ++p) {
+                if (rand(3) == 0) {
+                    continue;
+                }
+                mutation m(s, ss.make_pkey(p));
+                const unsigned rows = rand(8) ? rand(60) : 1500 + rand(1500);
+                // Large partitions must exceed the 256 KiB index-jump threshold.
+                const sstring v(rows >= 1500 ? 400 : 1, 'v');
+                if (rand(5) == 0) {
+                    m.partition().apply(tombstone(base + rand(1000), deletion_time));
+                }
+                if (rand(2)) {
+                    ss.add_static_row(m, "static", base + rand(500));
+                }
+                for (unsigned r = rand(10); r < rows; r += 1 + rand(3)) {
+                    ss.add_row(m, ss.make_ckey(r), v, base + rand(500));
+                }
+                for (unsigned k = rand(4); k > 0 && rows; --k) {
+                    const auto a = rand(rows);
+                    ss.delete_range(m, ss.make_ckey_range(a, a + rand(rows / 2 + 1)), tombstone(base + rand(1000), deletion_time));
+                }
+                for (unsigned k = rand(3); k > 0 && rows; --k) {
+                    m.partition().clustered_row(*s, ss.make_ckey(rand(rows))).apply(tombstone(base + rand(1000), deletion_time));
+                }
+                muts.push_back(std::move(m));
+            }
+            if (!muts.empty()) {
+                ssts.push_back(make_sstable_containing(env.make_sst_factory(s), std::move(muts)).get());
+            }
+        }
+        return ssts;
+    };
+
+    testlog.info("compaction_skip_shadowed_data_random: seed {}", seed);
+    check_skip_shadowed_data_output(env, cf, s, make_inputs);
+}
+
+SEASTAR_TEST_CASE(compaction_skip_shadowed_data_random) {
+    return test_env::do_with_async([](test_env& env) {
+        const auto before = sstables::sstables_stats::get_shard_stats();
+        for (uint32_t seed = 0; seed < 200; ++seed) {
+            test_skip_shadowed_data_random(env, seed);
+        }
+        const auto& after = sstables::sstables_stats::get_shard_stats();
+        // The seeds must exercise every skip tier, or the comparison proves nothing.
+        BOOST_REQUIRE_GT(after.shadowed_partitions_skipped, before.shadowed_partitions_skipped);
+        BOOST_REQUIRE_GT(after.shadowed_rows_skipped, before.shadowed_rows_skipped);
+        BOOST_REQUIRE_GT(after.shadowed_range_rows_skipped, before.shadowed_range_rows_skipped);
+        BOOST_REQUIRE_GT(after.shadowed_jumps, before.shadowed_jumps);
+    });
+}
+
+// Inputs from the reader-conformance generator (counters, collections, TTLs, every tombstone kind,
+// many equal timestamps), plus a newest input whose tombstones are newer than or equal to the others' max timestamp.
+static void test_skip_shadowed_data_generated(test_env& env, random_mutation_generator::generate_counters counters,
+        random_mutation_generator::generate_uncompactable uncompactable, uint32_t seed) {
+    random_mutation_generator gen(counters, local_shard_only::yes, uncompactable, seed);
+    auto s = gen.schema();
+    auto cf = env.make_table_for_tests(s);
+    auto close_cf = deferred_stop(cf);
+    std::mt19937 rng(seed);
+    const auto keys = gen.make_partition_keys(6);
+    std::vector<utils::chunked_vector<mutation>> data(2 + rng() % 3);
+    for (auto& input : data) {
+        for (auto& k : keys) {
+            if (rng() % 3) {
+                input.push_back(mutation(s, k, std::move(gen().partition())));
+            }
+        }
+    }
+    struct deletion {
+        unsigned kind;
+        unsigned input;
+        range_tombstone rt;
+    };
+    std::vector<deletion> deletions;
+    // Fixed, since make_inputs() runs once per compaction.
+    const auto deletion_time = gc_clock::now();
+    for (size_t i = 0; i < keys.size(); ++i) {
+        deletions.push_back({unsigned(rng() % 4), unsigned(rng() % data.size()), gen.make_random_range_tombstone()});
+    }
+
+    auto make_inputs = [&] {
+        std::vector<shared_sstable> ssts;
+        for (auto& input : data) {
+            if (!input.empty()) {
+                ssts.push_back(make_sstable_containing(env.make_sst_factory(s), input).get());
+            }
+        }
+        auto max_ts = api::min_timestamp;
+        for (auto& sst : ssts) {
+            max_ts = std::max(max_ts, sst->get_stats_metadata().max_timestamp);
+        }
+        utils::chunked_vector<mutation> muts;
+        for (size_t i = 0; i < keys.size(); ++i) {
+            mutation m(s, keys[i]);
+            auto& d = deletions[i];
+            switch (d.kind) {
+            case 0: m.partition().apply(tombstone(max_ts + 1, deletion_time)); break;
+            // Equal to one input's max timestamp: that input must not be skipped.
+            case 1: if (!ssts.empty()) {
+                    m.partition().apply(tombstone(ssts[d.input % ssts.size()]->get_stats_metadata().max_timestamp, deletion_time));
+                }
+                break;
+            case 2: m.partition().apply_delete(*s, range_tombstone(d.rt.start, d.rt.start_kind, d.rt.end, d.rt.end_kind,
+                    tombstone(max_ts + 1, deletion_time)));
+                break;
+            case 3: break;
+            }
+            if (!m.partition().empty()) {
+                muts.push_back(std::move(m));
+            }
+        }
+        if (!muts.empty()) {
+            ssts.push_back(make_sstable_containing(env.make_sst_factory(s), std::move(muts)).get());
+        }
+        return ssts;
+    };
+
+    testlog.info("compaction_skip_shadowed_data_generated: counters={} uncompactable={} seed={}", bool(counters), bool(uncompactable), seed);
+    check_skip_shadowed_data_output(env, cf, s, make_inputs);
+}
+
+SEASTAR_TEST_CASE(compaction_skip_shadowed_data_generated) {
+    return test_env::do_with_async([](test_env& env) {
+        const auto before = sstables::sstables_stats::get_shard_stats();
+        for (uint32_t seed = 0; seed < 30; ++seed) {
+            for (auto counters : {random_mutation_generator::generate_counters::no, random_mutation_generator::generate_counters::yes}) {
+                for (auto uc : {random_mutation_generator::generate_uncompactable::no, random_mutation_generator::generate_uncompactable::yes}) {
+                    test_skip_shadowed_data_generated(env, counters, uc, seed);
+                }
+            }
+        }
+        const auto& after = sstables::sstables_stats::get_shard_stats();
+        BOOST_REQUIRE_GT(after.shadowed_partitions_skipped, before.shadowed_partitions_skipped);
+    });
+}
+
+// Large partitions split across the fragments of an sstable run, deleted by a newer input.
+SEASTAR_TEST_CASE(compaction_skip_shadowed_data_split_run) {
+    return test_env::do_with_async([](test_env& env) {
+        simple_schema ss;
+        // Uncompressed, so each partition spans several fragments.
+        auto s = schema_builder(ss.schema()).set_compressor_params(compression_parameters::no_compression()).build();
+        ss.set_schema(s);
+        auto cf = env.make_table_for_tests(s);
+        auto close_cf = deferred_stop(cf);
+        const sstring v(400, 'v');
+        const auto deletion_time = gc_clock::now() - std::chrono::hours(1);
+        bool split = false;
+
+        auto make_inputs = [&] {
+            utils::chunked_vector<mutation> muts;
+            for (unsigned p = 0; p < 3; ++p) {
+                mutation m(s, ss.make_pkey(p));
+                for (unsigned r = 0; r < 2000; ++r) {
+                    ss.add_row(m, ss.make_ckey(r), v, 1000 + r % 7);
+                }
+                muts.push_back(std::move(m));
+            }
+            auto old = make_sstable_containing(env.make_sst_factory(s), std::move(muts)).get();
+            auto desc = compaction::compaction_descriptor({old});
+            desc.max_sstable_bytes = 128 * 1024;
+            desc.can_split_large_partition = true;
+            auto ssts = compact_sstables(env, std::move(desc), cf, env.make_sst_factory(s), replacer_fn_no_op(), can_purge_tombstones::no).get().new_sstables;
+            for (size_t i = 0; i < ssts.size(); ++i) {
+                ssts[i] = env.reusable_sst(s, ssts[i]).get();
+                split |= i && ssts[i]->get_first_decorated_key().equal(*s, ssts[i - 1]->get_last_decorated_key());
+            }
+            muts.clear();
+            mutation m0(s, ss.make_pkey(0));
+            m0.partition().apply(tombstone(5000, deletion_time));
+            muts.push_back(std::move(m0));
+            mutation m1(s, ss.make_pkey(1));
+            ss.delete_range(m1, ss.make_ckey_range(500, 1500), tombstone(5000, deletion_time));
+            muts.push_back(std::move(m1));
+            ssts.push_back(make_sstable_containing(env.make_sst_factory(s), std::move(muts)).get());
+            return ssts;
+        };
+
+        const auto before = sstables::sstables_stats::get_shard_stats();
+        check_skip_shadowed_data_output(env, cf, s, make_inputs);
+        const auto& after = sstables::sstables_stats::get_shard_stats();
+        // Otherwise the test doesn't cover a partition continuing in the next fragment.
+        BOOST_REQUIRE(split);
+        BOOST_REQUIRE_GT(after.shadowed_partitions_skipped, before.shadowed_partitions_skipped);
+        BOOST_REQUIRE_GT(after.shadowed_range_rows_skipped, before.shadowed_range_rows_skipped);
+    });
+}
+
+// Split skips like regular compaction. Cleanup's multi-range reader wraps each sstable reader,
+// and wrappers don't forward the skip; reshape and scrub never skip.
+SEASTAR_TEST_CASE(compaction_skip_shadowed_data_compaction_types) {
+    return test_env::do_with_async([](test_env& env) {
+        simple_schema ss;
+        auto s = ss.schema();
+        auto cf = env.make_table_for_tests(s);
+        auto close_cf = deferred_stop(cf);
+        const sstring v(200, 'v');
+        const auto deletion_time = gc_clock::now() - std::chrono::hours(1);
+        const unsigned partitions = 8;
+
+        auto make_inputs = [&] {
+            std::vector<shared_sstable> ssts;
+            utils::chunked_vector<mutation> muts;
+            for (unsigned p = 0; p < partitions; ++p) {
+                mutation m(s, ss.make_pkey(p));
+                for (unsigned r = 0; r < 40; ++r) {
+                    ss.add_row(m, ss.make_ckey(r), v, 1000 + r % 7);
+                }
+                muts.push_back(std::move(m));
+            }
+            ssts.push_back(make_sstable_containing(env.make_sst_factory(s), std::move(muts)).get());
+            muts.clear();
+            for (unsigned p = 0; p < partitions; ++p) {
+                mutation m(s, ss.make_pkey(p));
+                if (p % 2) {
+                    ss.delete_range(m, ss.make_ckey_range(5, 30), tombstone(5000, deletion_time));
+                } else {
+                    m.partition().apply(tombstone(5000, deletion_time));
+                }
+                muts.push_back(std::move(m));
+            }
+            ssts.push_back(make_sstable_containing(env.make_sst_factory(s), std::move(muts)).get());
+            return ssts;
+        };
+
+        std::vector<dht::decorated_key> keys;
+        for (unsigned p = 0; p < partitions; ++p) {
+            keys.push_back(ss.make_pkey(p));
+        }
+        std::ranges::sort(keys, dht::decorated_key::less_comparator(s));
+        // Owns only half of the keys, so cleanup drops the rest.
+        auto owned = compaction::make_owned_ranges_ptr({dht::token_range::make({keys.front().token(), true}, {keys[partitions / 2].token(), true})});
+
+        const auto& stats = sstables::sstables_stats::get_shard_stats();
+        auto with_options = [] (compaction::compaction_type_options options, compaction::owned_ranges_ptr owned = {}) -> make_descriptor_fn {
+            return [=] (std::vector<shared_sstable> ssts) {
+                return compaction::compaction_descriptor(std::move(ssts), compaction::compaction_descriptor::default_level,
+                        compaction::compaction_descriptor::default_max_sstable_bytes, run_id::create_random_id(), options, owned);
+            };
+        };
+        auto classify = [] (dht::token t) -> mutation_writer::token_group_id { return t.raw() >= 0; };
+
+        auto split = with_options(compaction::compaction_type_options::make_split(classify));
+        auto before = stats.shadowed_partitions_skipped;
+        check_skip_shadowed_data_output(env, cf, s, make_inputs, split);
+        BOOST_REQUIRE_GT(stats.shadowed_partitions_skipped, before);
+
+        auto cleanup = with_options(compaction::compaction_type_options::make_cleanup(), owned);
+        before = stats.shadowed_partitions_skipped;
+        check_skip_shadowed_data_output(env, cf, s, make_inputs, cleanup);
+        BOOST_REQUIRE_EQUAL(stats.shadowed_partitions_skipped, before);
+
+        using scrub_mode = compaction::compaction_type_options::scrub::mode;
+        for (auto make_desc : {with_options(compaction::compaction_type_options::make_reshape()),
+                               with_options(compaction::compaction_type_options::make_scrub(scrub_mode::abort)),
+                               with_options(compaction::compaction_type_options::make_scrub(scrub_mode::segregate))}) {
+            const auto before = std::tuple(stats.shadowed_partitions_skipped, stats.shadowed_rows_skipped, stats.shadowed_range_rows_skipped);
+            compact_and_read(env, cf, s, make_inputs, true, make_desc);
+            BOOST_REQUIRE(std::tuple(stats.shadowed_partitions_skipped, stats.shadowed_rows_skipped, stats.shadowed_range_rows_skipped) == before);
+        }
     });
 }
 

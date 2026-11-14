@@ -285,6 +285,7 @@ test_env::impl::impl(test_env_config cfg, sstable_compressor_factory& scfarg, ss
                 .data_file_directories = db_config->data_file_directories(),
                 .format = db_config->sstable_format,
                 .large_data_records_per_sstable = db_config->compaction_large_data_records_per_sstable,
+                .compaction_skip_shadowed_data = db_config->compaction_skip_shadowed_data,
             },
             feature_service,
             cache_tracker,
