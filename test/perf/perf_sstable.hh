@@ -124,6 +124,8 @@ public:
         compaction::compaction_strategy_type compaction_strategy;
         api::timestamp_type timestamp_range;
         unsigned rows_per_partition = 0;
+        unsigned overlap_percent = 100;
+        bool compressible = false;
     };
 
 private:
@@ -144,6 +146,20 @@ private:
     }
 
     sstring random_column() {
+        if (_cfg.compressible) {
+            // 16-byte words, 90% from a 32-word vocabulary, 10% random: LZ4 compresses it ~2.6x at any column size.
+            if (_vocab.empty()) {
+                for (unsigned i = 0; i < 32; ++i) {
+                    _vocab.push_back(random_string(16));
+                }
+            }
+            sstring r;
+            while (r.size() < _cfg.column_size) {
+                r += _generator() % 10 ? _vocab[_generator() % _vocab.size()] : random_string(16);
+            }
+            r.resize(_cfg.column_size);
+            return r;
+        }
         return random_string(_cfg.column_size);
     }
 
@@ -153,6 +169,9 @@ private:
     std::uniform_int_distribution<char> _distribution;
     lw_shared_ptr<replica::memtable> _mt;
     std::vector<shared_sstable> _sst;
+    std::vector<sstring> _vocab;
+    // Generated once: generate_partition_keys() reseeds per call, so inputs would not share keys.
+    std::vector<dht::decorated_key> _keys;
 
     schema_ptr create_schema(compaction::compaction_strategy_type type) {
         schema_builder builder(this_smp_shard_count(), "ks", "perf-test", generate_legacy_id("ks", "perf-test"));
@@ -235,11 +254,18 @@ public:
         return _env.stop();
     }
 
-    future<> fill_memtable() {
-        auto idx = std::views::iota(0, int(_cfg.partitions / _cfg.sstables));
-        auto local_keys = tests::generate_partition_keys(int(_cfg.partitions / _cfg.sstables), s, local_shard_only::yes, tests::key_size{_cfg.key_size, _cfg.key_size});
-        return do_for_each(idx.begin(), idx.end(), [this, local_keys = std::move(local_keys)] (auto iteration) {
-            auto mut = mutation(this->s, local_keys.at(iteration));
+    // sst_idx picks the unique keys of one input; overlap_percent of the keys are shared by all inputs.
+    future<> fill_memtable(unsigned sst_idx = 0) {
+        const unsigned per_sst = _cfg.partitions / _cfg.sstables;
+        const unsigned shared = per_sst * _cfg.overlap_percent / 100;
+        const unsigned unique = per_sst - shared;
+        auto idx = std::views::iota(0, int(per_sst));
+        if (_keys.empty()) {
+            _keys = tests::generate_partition_keys(shared + unique * _cfg.sstables, s, local_shard_only::yes, tests::key_size{_cfg.key_size, _cfg.key_size});
+        }
+        return do_for_each(idx.begin(), idx.end(), [this, shared, unique, sst_idx] (auto iteration) {
+            const unsigned k = iteration < int(shared) ? iteration : shared + unique * sst_idx + (iteration - shared);
+            auto mut = mutation(this->s, _keys.at(k));
             for (unsigned row = 0; row < std::max(_cfg.rows_per_partition, 1u); ++row) {
                 auto ck = _cfg.rows_per_partition ? clustering_key::from_single_value(*this->s, int32_type->decompose(int32_t(row))) : clustering_key::make_empty();
                 for (auto& cdef: this->s->regular_columns()) {
@@ -296,9 +322,15 @@ public:
                 std::vector<shared_sstable> ssts;
                 for (auto i = 0u; i < _cfg.sstables; i++) {
                     auto sst = sst_gen();
+                    if (_cfg.overlap_percent < 100) {
+                        _mt = make_lw_shared<replica::memtable>(s);
+                        fill_memtable(i).get();
+                    }
                     write_memtable_to_sstable(*_mt, sst).get();
                     sst->open_data().get();
-                    _mt->revert_flushed_memory();
+                    if (_cfg.overlap_percent >= 100) {
+                        _mt->revert_flushed_memory();
+                    }
                     ssts.push_back(std::move(sst));
                 }
 

@@ -125,6 +125,8 @@ int scylla_sstable_main(int argc, char** argv) {
         ("compaction-strategy", bpo::value<sstring>()->default_value("IncrementalCompactionStrategy"), "compaction strategy to use, one of "
              "(IncrementalCompactionStrategy, LeveledCompactionStrategy, TimeWindowCompactionStrategy)")
         ("rows-per-partition", bpo::value<unsigned>()->default_value(0), "clustering rows per partition; 0 means a single row without a clustering key")
+        ("overlap-percent", bpo::value<unsigned>()->default_value(100), "compaction mode: percent of keys shared by all input sstables")
+        ("compressible", bpo::bool_switch(), "use cell values LZ4 compresses about 2.6x")
         ("timestamp-range", bpo::value<api::timestamp_type>()->default_value(0), "Timestamp values to use, chosen uniformly from: [-x, +x]");
 
     return app.run(argc, argv, [&app] {
@@ -150,6 +152,11 @@ int scylla_sstable_main(int argc, char** argv) {
             }
             cfg.compaction_strategy = compaction::compaction_strategy::type(app.configuration()["compaction-strategy"].as<sstring>());
             cfg.timestamp_range = app.configuration()["timestamp-range"].as<api::timestamp_type>();
+            cfg.overlap_percent = app.configuration()["overlap-percent"].as<unsigned>();
+            if (cfg.overlap_percent > 100) {
+                throw std::invalid_argument("--overlap-percent must be at most 100");
+            }
+            cfg.compressible = app.configuration()["compressible"].as<bool>();
             cfg.rows_per_partition = app.configuration()["rows-per-partition"].as<unsigned>();
             auto scf = make_sstable_compressor_factory_for_tests_in_thread();
             test.start(std::move(cfg), std::ref(*scf)).get();
