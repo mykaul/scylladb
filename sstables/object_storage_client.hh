@@ -88,7 +88,8 @@ public:
     // come directly after the object being written, ahead of the remaining
     // parameters, matching the order the backend clients use.
     virtual future<> put_object(object_name, ::memory_data_sink_buffers bufs, object_storage_attributes, abort_source* = nullptr) = 0;
-    virtual future<> copy_object(object_name src, object_name dst, object_storage_attributes, abort_source* = nullptr) = 0;
+    // single_request: S3 skips the size HEAD and falls back to multipart only if refused. GCS ignores it.
+    virtual future<> copy_object(object_name src, object_name dst, object_storage_attributes, abort_source* = nullptr, bool single_request = false) = 0;
     virtual future<> delete_object(object_name, abort_source* = nullptr) = 0;
     // Deletes the objects (named relative to the bucket) with as few requests as the backend
     // allows. Not atomic: all objects are attempted, and if some fail, so does the call.
