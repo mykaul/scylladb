@@ -189,12 +189,19 @@ collection_mutation_compact_and_expire_result compact_and_expire(
         tomb = tombstone();
     }
     t.apply(base_tomb.regular());
+    // Created only once there is something to collect: most collections have no garbage.
     std::optional<collection_mutation_writer> losers;
-    if (collector) {
+    if (collector && purged_tomb) {
         losers.emplace(purged_tomb);
     }
+    auto collect = [&] (managed_bytes_view key, atomic_cell_view cell) {
+        if (!losers) {
+            losers.emplace(purged_tomb);
+        }
+        losers->push_back(key, cell);
+    };
     auto finish = [&] (std::optional<collection_mutation> collection) -> collection_mutation_compact_and_expire_result {
-        if (collector) {
+        if (losers) {
             collector->collect(id, std::move(*losers).finish());
         }
         return {std::move(collection), std::move(res)};
@@ -238,15 +245,15 @@ collection_mutation_compact_and_expire_result compact_and_expire(
             auto dead = atomic_cell::make_dead(cell.timestamp(), cell.deletion_time());
             if (cannot_erase_cell()) {
                 survivors.push_back(key, std::move(dead));
-            } else if (losers) {
-                losers->push_back(key, std::move(dead));
+            } else if (collector) {
+                collect(key, atomic_cell_view(dead));
             }
             res.dead_cells++;
         } else if (!cell.is_live()) {
             if (cannot_erase_cell()) {
                 survivors.push_back(key, cell);
-            } else if (losers) {
-                losers->push_back(key, cell);
+            } else if (collector) {
+                collect(key, cell);
             }
             res.dead_cells++;
         } else {

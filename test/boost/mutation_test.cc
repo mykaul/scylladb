@@ -3042,7 +3042,24 @@ SEASTAR_THREAD_TEST_CASE(test_collection_compaction) {
         BOOST_CHECK_EQUAL(v.size(), 0);
     }
 
-    // Nothing to compact with a collector attached: input kept, collector gets an empty collection.
+    // Purgeable dead cell, no collection tombstone: only that cell is collected.
+    {
+        collecting_gc gc;
+        cmut = make_collection_mutation({}, key, make_collection_member(bytes_type, value),
+                to_bytes("key2"), atomic_cell::make_dead(2, gc_clock::time_point()));
+        auto [out, res] = compact_and_expire(cmut, 0, *bytes_type, row_tombstone(), gc_clock::time_point(), always_gc,
+                gc_clock::time_point() + std::chrono::seconds(1), &gc);
+        BOOST_CHECK_EQUAL(res.live_cells, 1);
+        BOOST_CHECK_EQUAL(res.dead_cells, 1);
+        BOOST_REQUIRE(out);
+        BOOST_CHECK_EQUAL(collection_mutation_view(*out).size(), 1);
+        BOOST_REQUIRE_EQUAL(gc.collected.size(), 1);
+        collection_mutation_view v = gc.collected.front();
+        BOOST_CHECK(!v.tomb());
+        BOOST_CHECK_EQUAL(v.size(), 1);
+    }
+
+    // Nothing to compact with a collector attached: input kept, collector not called.
     {
         collecting_gc gc;
         cmut = make_collection_mutation({}, key, make_collection_member(bytes_type, value));
@@ -3050,8 +3067,7 @@ SEASTAR_THREAD_TEST_CASE(test_collection_compaction) {
                 gc_clock::time_point() + std::chrono::seconds(1), &gc);
         BOOST_CHECK_EQUAL(res.live_cells, 1);
         BOOST_CHECK(!out);
-        BOOST_REQUIRE_EQUAL(gc.collected.size(), 1);
-        BOOST_CHECK(collection_mutation_view(gc.collected.front()).empty());
+        BOOST_CHECK(gc.collected.empty());
     }
 }
 
