@@ -20,6 +20,7 @@
 #include "mutation_query.hh"
 #include "mutation_compactor.hh"
 #include "counters.hh"
+#include "mutation/atomic_cell_hash.hh"
 #include "db/row_cache.hh"
 #include "timestamp.hh"
 #include "view_info.hh"
@@ -730,10 +731,21 @@ void write_counter_cell(RowWriter& w, const query::partition_slice& slice, ::ato
             .end_qr_cell();
 }
 
+// A cell's hash as fed into a fresh xx_hasher, i.e. the cached cell hash.
+static uint64_t cell_xxhash(atomic_cell_or_collection_view c, const column_definition& def) {
+    if (def.is_atomic()) {
+        return atomic_cell_xxhash(c.as_atomic_cell(def), def);
+    }
+    query::default_hasher h;
+    feed_hash(h, c.as_collection_mutation(), def);
+    return h.finalize_uint64();
+}
+
 template<typename Hasher>
 void appending_hash<row>::operator()(Hasher& h, const row& cells, const schema& s, column_kind kind, const query::column_id_vector& columns, max_timestamp& max_ts) const {
+    row::cell_and_hash_finder find(cells);
     for (auto id : columns) {
-        auto cell_and_hash = cells.find_cell_and_hash(id);
+        auto cell_and_hash = find(id);
         if (!cell_and_hash) {
             feed_hash(h, appending_hash<row>::null_hash_value);
             continue;
@@ -745,9 +757,7 @@ void appending_hash<row>::operator()(Hasher& h, const row& cells, const schema& 
                 if (cell_and_hash->hash) {
                     feed_hash(h, *cell_and_hash->hash);
                 } else {
-                    Hasher cellh;
-                    feed_hash(cellh, cell_and_hash->cell.as_atomic_cell(def), def);
-                    feed_hash(h, cellh.finalize_uint64());
+                    feed_hash(h, atomic_cell_xxhash(cell_and_hash->cell.as_atomic_cell(def), def));
                 }
             } else {
                 feed_hash(h, cell_and_hash->cell.as_atomic_cell(def), def);
@@ -781,9 +791,7 @@ void row::prepare_hash(const schema& s, column_kind kind) const {
     // const to avoid removing const qualifiers on the read path
     for_each_cell([&s, kind] (column_id id, const cell_and_hash_view& c_a_h) {
         if (!c_a_h.hash) {
-            query::default_hasher cellh;
-            feed_hash(cellh, c_a_h.cell, s.column_at(kind, id));
-            c_a_h.hash = cell_hash{cellh.finalize_uint64()};
+            c_a_h.hash = cell_hash{cell_xxhash(c_a_h.cell, s.column_at(kind, id))};
         }
     });
 }

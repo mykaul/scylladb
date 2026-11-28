@@ -15,6 +15,7 @@
 #include "atomic_cell_or_collection.hh"
 #include "utils/hashing.hh"
 #include "counters.hh"
+#include "utils/xx_hasher.hh"
 
 template<>
 struct appending_hash<collection_mutation_view> {
@@ -85,3 +86,31 @@ struct appending_hash<atomic_cell_or_collection> {
         appending_hash<atomic_cell_or_collection_view>()(h, atomic_cell_or_collection_view(c), cdef);
     }
 };
+
+// Collects the fed bytes; the caller guarantees they fit.
+template<size_t N>
+struct atomic_cell_hash_buffer {
+    std::array<char, N> buf;
+    size_t len = 0;
+
+    void update(const char* ptr, size_t size) noexcept {
+        std::copy_n(ptr, size, buf.data() + len);
+        len += size;
+    }
+};
+
+// The cell's hash as fed into a fresh xx_hasher. Small cells take one XXH64() call,
+// since the streaming state setup and per-field updates dominate their cost.
+inline uint64_t atomic_cell_xxhash(atomic_cell_view cell, const column_definition& cdef) {
+    constexpr size_t buffer_size = 256;
+    // is_live, timestamp, expiry (<= 8), ttl and the value size, besides the value bytes.
+    constexpr size_t max_overhead = 1 + 8 + 8 + 8 + 8;
+    if (!cell.is_live() || (!cdef.is_counter() && cell.value_size() <= buffer_size - max_overhead)) {
+        atomic_cell_hash_buffer<buffer_size> b;
+        feed_hash(b, cell, cdef);
+        return XXH64(b.buf.data(), b.len, 0);
+    }
+    xx_hasher h;
+    feed_hash(h, cell, cdef);
+    return h.finalize_uint64();
+}

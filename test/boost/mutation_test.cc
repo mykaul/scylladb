@@ -57,6 +57,7 @@
 #include "types/user.hh"
 #include "mutation/mutation_rebuilder.hh"
 #include "mutation/mutation_partition.hh"
+#include "mutation/atomic_cell_hash.hh"
 #include "mutation/async_utils.hh"
 #include "keys/clustering_key_filter.hh"
 #include "readers/from_mutations.hh"
@@ -3412,6 +3413,36 @@ SEASTAR_THREAD_TEST_CASE(test_appending_hash_row_4567) {
     // Additional test for making sure that {"", NULL, "bbb"} is not equal to {"", "bbb", NULL}
     // due to ignoring NULL in a hash
     BOOST_CHECK_NE(compute_hash(r2, { 0, 1, 2 }), compute_hash(r3, { 0, 1, 2 }));
+}
+
+// atomic_cell_xxhash() must match the streaming xx_hasher, which digests and cached cell hashes use.
+SEASTAR_THREAD_TEST_CASE(test_atomic_cell_xxhash_matches_streaming) {
+    auto s = schema_builder(this_smp_shard_count(), "ks", "cf")
+        .with_column("pk", bytes_type, column_kind::partition_key)
+        .with_column("v", bytes_type)
+        .build();
+    const auto& def = *s->get_column_definition("v");
+
+    auto check = [&] (const atomic_cell& c) {
+        xx_hasher h;
+        feed_hash(h, atomic_cell_view(c), def);
+        BOOST_REQUIRE_EQUAL(atomic_cell_xxhash(c, def), h.finalize_uint64());
+    };
+
+    const auto expiry = gc_clock::now() + std::chrono::hours(1);
+    // Needs the upper 32 bits, which change how gc_clock::time_point is fed.
+    const auto far_expiry = gc_clock::time_point(gc_clock::duration(int64_t(1) << 33));
+    for (size_t size : {0, 1, 8, 100, 127, 128, 222, 223, 224, 256, 1000, 300000}) {
+        auto value = tests::random::get_bytes(size);
+        check(atomic_cell::make_live(*bytes_type, 7, value));
+        check(atomic_cell::make_live(*bytes_type, -1, value, expiry, std::chrono::hours(1)));
+        check(atomic_cell::make_live(*bytes_type, 7, value, far_expiry, std::chrono::seconds(10)));
+    }
+    check(atomic_cell::make_dead(7, gc_clock::now()));
+    check(atomic_cell::make_dead(api::min_timestamp, far_expiry));
+    // The 300000-byte value above is fragmented.
+    auto large = atomic_cell::make_live(*bytes_type, 7, tests::random::get_bytes(300000));
+    BOOST_REQUIRE(!atomic_cell_view(large).value().is_linearized());
 }
 
 SEASTAR_THREAD_TEST_CASE(test_mutation_consume) {

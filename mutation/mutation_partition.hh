@@ -13,6 +13,7 @@
 
 #include <seastar/util/optimized_optional.hh>
 
+#include <limits>
 #include <ranges>
 
 #include "schema/schema_fwd.hh"
@@ -114,6 +115,26 @@ public:
     std::optional<atomic_cell_or_collection_view> find_cell(column_id id) const;
     // Returns a view of cell's value and hash or a disengaged optional if column is not set.
     std::optional<cell_and_hash_view> find_cell_and_hash(column_id id) const;
+
+    // find_cell_and_hash() for a sequence of columns; reuses the last block for the next column in it.
+    class cell_and_hash_finder {
+        const row& _row;
+        block_index_type _block_index = std::numeric_limits<block_index_type>::max();
+        const block_type* _block = nullptr;
+    public:
+        explicit cell_and_hash_finder(const row& r) noexcept : _row(r) {}
+        std::optional<cell_and_hash_view> operator()(column_id id) {
+            if (auto bi = block_index_of(id); bi != _block_index) {
+                _block_index = bi;
+                _block = _row._cells.find_block(bi);
+            }
+            auto slot = slot_of(id);
+            if (!_block || !_block->contains(slot)) {
+                return std::nullopt;
+            }
+            return cell_and_hash_view{atomic_cell_or_collection_view(_block->cell(slot)), _block->hash(slot)};
+        }
+    };
 
     // Builds the cells of a row a block at a time, rather than rebuilding a
     // block for every cell, as append_cell() and apply() do.
